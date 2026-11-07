@@ -184,9 +184,10 @@ It records parameter and gradient L2 norms, RMS and absolute maxima; raw gradien
 are reconstructed from the native clipping coefficient. Both the pre-clipping
 gradient norm and the post-clipping norm are retained. FP32 master-weight
 snapshots provide actual parameter changes (`delta_*`) and relative updates.
-`update_*` describes the AdamW direction recovered from those changes after
-removing the applied learning rate and decoupled weight decay. This recovery
-includes FP32 master-weight rounding, rather than BF16 model-copy rounding.
+`update_*` describes the bias-corrected AdamW direction computed directly from
+the optimizer's FP32 first and second moments and epsilon, excluding learning
+rate and decoupled weight decay. Actual `delta_*` includes FP32 master-weight
+rounding, rather than BF16 model-copy rounding.
 DP optimizer shards are counted once, and absolute maxima use MAX reductions.
 
 Forward hooks record hidden RMS and absmax at each block, TimeMix and ChannelMix

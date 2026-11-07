@@ -30,6 +30,14 @@ class RWKV7ForecastConfig(RWKV7ModelConfig):
         return total + float(tokens * 6 * self.hidden_size * (10 - self.vocab_size))
 
 
+class RWKV7ForecastHead(nn.Linear):
+    """Compute a continuous regression head in FP32 with normal module hooks."""
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Project in FP32 while preserving the parameter storage precision."""
+        return F.linear(hidden.float(), self.weight.float(), self.bias.float())
+
+
 class RWKV7ForecastModel(RWKV7Model):
     """Predict encoded open/close returns, upper/lower wicks and log volume.
 
@@ -43,7 +51,8 @@ class RWKV7ForecastModel(RWKV7Model):
         self.hf = self.hf.model
         self.hf.embed_tokens = nn.Identity()
         self.input_projection = nn.Linear(5, model_config.hidden_size, dtype=torch.bfloat16)
-        self.output_projection = nn.Linear(model_config.hidden_size, 5, dtype=torch.bfloat16)
+        head = RWKV7ForecastHead if getattr(self.hf.config, "forecast_head_fp32", False) else nn.Linear
+        self.output_projection = head(model_config.hidden_size, 5, dtype=torch.bfloat16)
         if getattr(self.hf.config, "forecast_initialization", "linear") == "calibrated":
             # Initialize in FP32 before rounding, as in RWKV-LM's generated weights.
             with torch.no_grad():
@@ -83,10 +92,7 @@ class RWKV7ForecastModel(RWKV7Model):
             past_key_values=past_key_values,
             use_cache=past_key_values is not None,
         ).last_hidden_state
-        if getattr(self.hf.config, "forecast_head_fp32", False):
-            raw = F.linear(hidden.float(), self.output_projection.weight.float(), self.output_projection.bias.float())
-        else:
-            raw = self.output_projection(hidden).float()
+        raw = self.output_projection(hidden).float()
         # Positive wicks guarantee high >= max(open, close), low <= min(open, close).
         prediction = torch.cat((raw[..., :2], F.softplus(raw[..., 2:])), dim=-1)
         if labels is None:

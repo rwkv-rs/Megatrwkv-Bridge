@@ -115,8 +115,12 @@ def test_calibrated_head_has_training_prior_and_fp32_output(config):
     )
     model = RWKV7ForecastModel(config, None)
     hidden = torch.zeros(2, 8, config.hidden_size, dtype=torch.bfloat16)
+    outputs = []
+    handle = model.output_projection.register_forward_hook(lambda module, inputs, output: outputs.append(output))
     with patch.object(model.hf, "forward", return_value=SimpleNamespace(last_hidden_state=hidden)):
         prediction = model(torch.zeros(2, 8, 5))
+    handle.remove()
+    assert len(outputs) == 1 and outputs[0].dtype == torch.float32
     torch.testing.assert_close(prediction[0, 0], torch.tensor([0.0, 0.0, 0.03, 0.04, 0.85]), atol=0.003, rtol=0.01)
     assert model.input_projection.bias.norm() > 0
     assert prediction.dtype == torch.float32
@@ -125,11 +129,22 @@ def test_calibrated_head_has_training_prior_and_fp32_output(config):
 def test_adamw_update_metrics_exclude_lr_and_decoupled_decay():
     from megatron.bridge.recipes.rwkv7.forecast_diagnostics import adamw_update_direction, tensor_statistics
 
-    before = torch.tensor([0.2, -0.4], dtype=torch.float32)
-    direction = torch.tensor([0.3, -0.1])
-    after = before - 0.01 * (direction + 0.1 * before)
-    recovered = adamw_update_direction(before, after, lr=0.01, weight_decay=0.1)
-    torch.testing.assert_close(recovered, direction)
+    parameter = torch.nn.Parameter(torch.tensor([0.2, -0.4], dtype=torch.float32))
+    optimizer = torch.optim.AdamW([parameter], lr=0.01, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
+    for step in range(1, 4):
+        before = parameter.detach().clone()
+        parameter.grad = torch.tensor([0.3 * step, -0.1])
+        optimizer.step()
+        state = optimizer.state[parameter]
+        direction = adamw_update_direction(
+            state["exp_avg"],
+            state["exp_avg_sq"],
+            step=step,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            bias_correction=True,
+        )
+        torch.testing.assert_close(parameter, before - 0.01 * (direction + 0.1 * before))
     stats = tensor_statistics(torch.tensor([3.0, -4.0]))
     torch.testing.assert_close(stats, torch.tensor([25.0, 2.0, 4.0]))
 

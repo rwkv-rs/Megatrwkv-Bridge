@@ -23,10 +23,19 @@ def tensor_statistics(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def adamw_update_direction(
-    before: torch.Tensor, after: torch.Tensor, *, lr: float, weight_decay: float
+    first_moment: torch.Tensor,
+    second_moment: torch.Tensor,
+    *,
+    step: int,
+    betas: tuple[float, float],
+    eps: float,
+    bias_correction: bool,
 ) -> torch.Tensor:
-    """Recover u_t from actual FP32 master-weight changes, excluding LR and decay."""
-    return (before - after) / lr - weight_decay * before
+    """Compute u_t from Adam moments, excluding learning rate and weight decay."""
+    beta1, beta2 = betas
+    correction1 = 1 - beta1**step if bias_correction else 1.0
+    correction2 = 1 - beta2**step if bias_correction else 1.0
+    return (first_moment / correction1) / ((second_moment / correction2).sqrt() + eps)
 
 
 def _module_name(name: str) -> str:
@@ -53,6 +62,7 @@ class ForecastDiagnosticsCallback(Callback):
         self.grad_history: deque[float] = deque(maxlen=100)
         self.loss_history: deque[float] = deque(maxlen=100)
         self.expected_squares: list[torch.Tensor] = []
+        self.state_owners: list[Any] = []
         self.capture = False
 
     def on_train_start(self, context: CallbackContext) -> None:
@@ -61,6 +71,7 @@ class ForecastDiagnosticsCallback(Callback):
         optimizer = context.optimizer
         optimizers = getattr(optimizer, "chained_optimizers", [optimizer])
         groups = {id(p): group for opt in optimizers for group in opt.param_groups for p in group["params"]}
+        owners = {id(p): opt.optimizer for opt in optimizers for group in opt.param_groups for p in group["params"]}
         names = set()
         for name, parameter in model.named_parameters():
             names.update(("global", _module_name(name)))
@@ -70,6 +81,7 @@ class ForecastDiagnosticsCallback(Callback):
             if master is not None:
                 self.parameters.append((name, master, groups[id(master)]))
                 self.expected_squares.append(master.detach().square().mean())
+                self.state_owners.append(owners[id(master)])
         self.names = sorted(names)
         for name, module in model.named_modules():
             if name in {"input_projection", "output_projection", "hf.norm"} or (
@@ -119,10 +131,18 @@ class ForecastDiagnosticsCallback(Callback):
         sums = torch.zeros((len(self.names), 7), device=device, dtype=torch.float64)
         maxima = torch.zeros((len(self.names), 4), device=device)
         index = {name: i for i, name in enumerate(self.names)}
-        for i, ((name, p, _), old, (lr, wd)) in enumerate(zip(self.parameters, self.before, self.hyperparameters)):
+        for i, ((name, p, group), old) in enumerate(zip(self.parameters, self.before)):
             raw_grad = p.grad.float() / coefficient
             delta = p.detach() - old
-            update = adamw_update_direction(old, p.detach(), lr=lr, weight_decay=wd)
+            state = self.state_owners[i].state[p]
+            update = adamw_update_direction(
+                state["exp_avg"],
+                state["exp_avg_sq"],
+                step=group["step"],
+                betas=group["betas"],
+                eps=group["eps"],
+                bias_correction=group["bias_correction"],
+            )
             values = torch.stack(
                 (
                     p.new_tensor(p.numel()),
