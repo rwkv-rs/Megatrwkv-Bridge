@@ -80,7 +80,8 @@ def train(args: argparse.Namespace) -> None:
         hf.forecast_target_mean = (total / count).tolist()
         hf.forecast_head_gain = args.head_gain
         logger.info("Training-only head calibration (%d bars): %s", count, hf.forecast_target_mean)
-    hf.forecast_head_fp32 = args.head_fp32
+    if args.head_fp32:
+        hf.forecast_head_fp32 = True
     # Count actual windows before resolving an epoch-based optimizer-step budget.
     for split in ("train", "validation", "test") if args.eval_iters else ("train",):
         dataset = OHLCVWindowDataset(
