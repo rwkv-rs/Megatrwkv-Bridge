@@ -70,16 +70,28 @@ def train(args: argparse.Namespace) -> None:
             keep_tail=True,
             seed=args.seed,
         )
-        total, count = np.zeros(5, dtype=np.float64), 0
+        total, feature_total, feature_squares = (np.zeros(5, dtype=np.float64) for _ in range(3))
+        count = 0
         for i in range(args.calibration_windows):
             sample = calibration[i * calibration.num_windows // args.calibration_windows]
             mask = sample["loss_mask"].astype(bool)
             total += sample["labels"][mask].sum(axis=0, dtype=np.float64)
+            if args.normalize_inputs:
+                features = sample["features"][mask].astype(np.float64)
+                feature_total += features.sum(axis=0)
+                feature_squares += np.square(features).sum(axis=0)
             count += int(mask.sum())
         hf.forecast_initialization = "calibrated"
         hf.forecast_target_mean = (total / count).tolist()
         hf.forecast_head_gain = args.head_gain
         logger.info("Training-only head calibration (%d bars): %s", count, hf.forecast_target_mean)
+        if args.normalize_inputs:
+            mean = feature_total / count
+            std = np.sqrt(np.maximum(feature_squares / count - mean**2, 0))
+            std[std == 0] = 1
+            hf.forecast_input_mean = mean.tolist()
+            hf.forecast_input_std = std.tolist()
+            logger.info("Training-only input mean=%s std=%s", hf.forecast_input_mean, hf.forecast_input_std)
     if args.head_fp32:
         hf.forecast_head_fp32 = True
     if args.rwkv_optimizer:
@@ -318,6 +330,9 @@ def main() -> None:
     training.add_argument("--head-gain", type=float, default=0.01, help="Orthogonal gain of the calibrated head")
     training.add_argument("--head-fp32", action="store_true", help="Compute the continuous output projection in FP32")
     training.add_argument(
+        "--normalize-inputs", action="store_true", help="Standardize encoded inputs using training-only calibration"
+    )
+    training.add_argument(
         "--rwkv-optimizer", action="store_true", help="Use RWKV-LM matrix-only decay and 2x w0 learning rate"
     )
     training.add_argument("--diagnostics-interval", type=int, default=0, help="Module/activation metrics interval")
@@ -338,6 +353,8 @@ def main() -> None:
     evaluation.set_defaults(handler=evaluate)
     args = parser.parse_args()
     if args.command == "train":
+        if args.normalize_inputs and not args.calibration_windows:
+            parser.error("--normalize-inputs requires --calibration-windows > 0")
         if args.steps is None and args.epochs is None:
             args.steps = 10000
         if (

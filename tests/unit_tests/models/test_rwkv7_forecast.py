@@ -149,6 +149,31 @@ def test_adamw_update_metrics_exclude_lr_and_decoupled_decay():
     torch.testing.assert_close(stats, torch.tensor([25.0, 2.0, 4.0]))
 
 
+def test_input_standardization_is_persisted_and_preserves_encoded_targets(config):
+    config.hf_config.update(
+        forecast_input_mean=[0.0, 0.0, 0.03, 0.04, 0.85],
+        forecast_input_std=[0.1, 0.1, 0.05, 0.05, 0.3],
+    )
+    model = RWKV7ForecastModel(config, None)
+    restored = RWKV7ForecastModel(RWKV7ForecastConfig.from_dict(config.as_dict()), None)
+    restored.load_state_dict(model.state_dict(), strict=True)
+    inputs = []
+    handle = model.input_projection.register_forward_pre_hook(lambda module, args: inputs.append(args[0]))
+    features = torch.randn(2, 8, 5)
+    labels = torch.randn_like(features)
+    with patch.object(
+        model.hf, "forward", side_effect=lambda **kwargs: SimpleNamespace(last_hidden_state=kwargs["inputs_embeds"])
+    ):
+        prediction = model(features)
+        loss = model(features, labels=labels)
+    handle.remove()
+    expected = ((features - model.feature_mean.float()) / model.feature_std.float()).bfloat16()
+    torch.testing.assert_close(inputs[0], expected, rtol=0, atol=0)
+    torch.testing.assert_close(loss, F.smooth_l1_loss(prediction, labels, reduction="none").mean(-1))
+    assert not any("feature_mean" in key or "feature_std" in key for key in model.state_dict())
+    torch.testing.assert_close(restored.feature_mean, model.feature_mean, rtol=0, atol=0)
+
+
 def test_channel_losses_use_identical_mask_and_valid_count():
     channels = torch.arange(20, dtype=torch.float32).reshape(1, 4, 5)
     mask = torch.tensor([[1.0, 1.0, 0.0, 0.0]])

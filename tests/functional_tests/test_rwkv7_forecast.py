@@ -32,6 +32,8 @@ def test_forecast_gradients_cached_rollout_and_fresh_process_reload(tmp_path, in
         hf.forecast_target_mean = [0.0, 0.0, 0.03, 0.04, 0.85]
         hf.forecast_head_gain = 0.01
         hf.forecast_head_fp32 = True
+        hf.forecast_input_mean = [0.0, 0.0, 0.03, 0.04, 0.85]
+        hf.forecast_input_std = [0.1, 0.1, 0.05, 0.05, 0.3]
     config = rwkv7_ohlcv_config(
         hf,
         data=tmp_path,

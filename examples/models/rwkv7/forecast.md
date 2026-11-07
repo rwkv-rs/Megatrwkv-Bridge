@@ -217,6 +217,15 @@ channels. `--head-fp32` computes the final projection in FP32 while retaining
 BF16 parameter storage and the existing RWKV backbone precision. These choices
 are persisted in the HF configuration in `run.json` and exported checkpoints.
 
+`--normalize-inputs` additionally centers and standardizes the five encoded input
+channels using the same training-only calibration windows. It leaves targets,
+loss units and OHLCV decoding unchanged. The model applies these fixed statistics
+to both observed context and generated bars during rollout. Statistics are stored
+in the HF configuration, and the derived nonpersistent buffers explicitly use
+BF16 storage so native training and standalone reload use identical rounded
+statistics. Constant channels use a scale of one. This option requires a positive
+`--calibration-windows` count and needs a new training run.
+
 `--rwkv-optimizer` selects RWKV-LM's parameter groups: only matrix parameters
 whose names end in `.weight` receive weight decay; TimeMix vectors, low-rank
 factors and biases do not. The `w0` decay logits use twice the base learning rate.

@@ -53,6 +53,18 @@ class RWKV7ForecastModel(RWKV7Model):
         self.input_projection = nn.Linear(5, model_config.hidden_size, dtype=torch.bfloat16)
         head = RWKV7ForecastHead if getattr(self.hf.config, "forecast_head_fp32", False) else nn.Linear
         self.output_projection = head(model_config.hidden_size, 5, dtype=torch.bfloat16)
+        self.normalize_inputs = hasattr(self.hf.config, "forecast_input_mean")
+        if self.normalize_inputs:
+            # Explicit BF16 storage matches native wrapping and standalone reload.
+            for name, values in (
+                ("feature_mean", self.hf.config.forecast_input_mean),
+                ("feature_std", self.hf.config.forecast_input_std),
+            ):
+                self.register_buffer(
+                    name,
+                    torch.tensor(values, device=self.input_projection.weight.device, dtype=torch.bfloat16),
+                    persistent=False,
+                )
         if getattr(self.hf.config, "forecast_initialization", "linear") == "calibrated":
             # Initialize in FP32 before rounding, as in RWKV-LM's generated weights.
             with torch.no_grad():
@@ -87,8 +99,11 @@ class RWKV7ForecastModel(RWKV7Model):
             labels: Encoded next bars with the same shape, already shifted once.
             past_key_values: HF RWKV cache used only for autoregressive inference.
         """
+        inputs = features.float()
+        if self.normalize_inputs:
+            inputs = (inputs - self.feature_mean.float()) / self.feature_std.float()
         hidden = self.hf(
-            inputs_embeds=self.input_projection(features.to(self.input_projection.weight.dtype)),
+            inputs_embeds=self.input_projection(inputs.to(self.input_projection.weight.dtype)),
             past_key_values=past_key_values,
             use_cache=past_key_values is not None,
         ).last_hidden_state
