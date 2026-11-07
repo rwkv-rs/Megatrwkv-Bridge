@@ -3,6 +3,8 @@
 
 """Native Bridge data and training configuration for next-bar OHLCV prediction."""
 
+import json
+import logging
 from dataclasses import dataclass, fields
 from functools import partial
 from pathlib import Path
@@ -20,6 +22,9 @@ from megatron.bridge.training.callbacks import Callback, CallbackContext
 from megatron.bridge.training.config import ConfigContainer
 from megatron.bridge.training.losses import validate_local_loss
 from megatron.bridge.training.state import GlobalState
+
+
+logger = logging.getLogger(__name__)
 
 
 class ForecastRun(TypedDict):
@@ -168,8 +173,34 @@ class ForecastExportCallback(Callback):
 
     def on_train_end(self, context: CallbackContext) -> None:
         """Save inference weights after the native training checkpoint lifecycle."""
+        memory = torch.tensor(
+            [torch.cuda.max_memory_allocated() / 2**30, torch.cuda.max_memory_reserved() / 2**30],
+            device="cuda",
+            dtype=torch.float64,
+        )
+        all_memory = [torch.empty_like(memory) for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather(all_memory, memory)
         if torch.distributed.get_rank() != 0:
             return
+        peaks = [
+            {"rank": rank, "allocated_gib": values[0], "reserved_gib": values[1]}
+            for rank, tensor in enumerate(all_memory)
+            for values in [tensor.cpu().tolist()]
+        ]
+        (self.output / "runtime.json").write_text(
+            json.dumps(
+                {
+                    "step": context.state.train_state.step,
+                    "gpu": torch.cuda.get_device_name(),
+                    "torch": torch.__version__,
+                    "cuda": torch.version.cuda,
+                    "peak_memory": peaks,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        logger.info("Forecast peak memory across ranks (GiB): %s", peaks)
         model = unwrap_model(context.model)[0]
         torch.save(
             {
