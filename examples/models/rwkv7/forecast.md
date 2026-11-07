@@ -208,6 +208,12 @@ mean squares. It is an approximate reference under the article's assumptions,
 not a target for every RWKV parameter. Decay-free parameters have no finite
 constant-LR stationary RMS.
 
+`--spike-snapshot` additionally saves `spike-before.pt` at the first detected
+event. It contains the exact BF16 model weights used before that optimizer step,
+the training configuration and the consumed-sample cursor. This allows a
+single-batch numerical investigation without relying on a nearby periodic
+checkpoint. It requires diagnostics and preserves an existing snapshot on resume.
+
 For a separately validated initialization experiment, add
 `--calibration-windows 4096 --head-gain 0.01 --head-fp32`. Calibration uses only
 training windows, initializes the input projection and its constant direction

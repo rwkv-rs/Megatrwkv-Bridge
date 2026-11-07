@@ -158,7 +158,11 @@ def train(args: argparse.Namespace) -> None:
     if args.diagnostics_interval:
         from megatron.bridge.recipes.rwkv7.forecast_diagnostics import ForecastDiagnosticsCallback
 
-        callbacks.append(ForecastDiagnosticsCallback(args.output, interval=args.diagnostics_interval))
+        callbacks.append(
+            ForecastDiagnosticsCallback(
+                args.output, interval=args.diagnostics_interval, spike_snapshot=args.spike_snapshot
+            )
+        )
     pretrain(cfg, forecast_forward_step, callbacks=callbacks)
 
 
@@ -336,6 +340,9 @@ def main() -> None:
         "--rwkv-optimizer", action="store_true", help="Use RWKV-LM matrix-only decay and 2x w0 learning rate"
     )
     training.add_argument("--diagnostics-interval", type=int, default=0, help="Module/activation metrics interval")
+    training.add_argument(
+        "--spike-snapshot", action="store_true", help="Save exact pre-update weights at the first detected spike"
+    )
     training.set_defaults(handler=train)
     prediction = commands.add_parser("predict", help="Autoregressively generate future OHLCV bars")
     prediction.add_argument("--checkpoint", type=Path, required=True)
@@ -355,6 +362,8 @@ def main() -> None:
     if args.command == "train":
         if args.normalize_inputs and not args.calibration_windows:
             parser.error("--normalize-inputs requires --calibration-windows > 0")
+        if args.spike_snapshot and not args.diagnostics_interval:
+            parser.error("--spike-snapshot requires --diagnostics-interval > 0")
         if args.steps is None and args.epochs is None:
             args.steps = 10000
         if (

@@ -56,7 +56,7 @@ class ForecastDiagnosticsCallback(Callback):
     snapshots avoid treating BF16 weight-copy rounding as an optimizer update.
     """
 
-    def __init__(self, output: Path, *, interval: int) -> None:
+    def __init__(self, output: Path, *, interval: int, spike_snapshot: bool = False) -> None:
         self.output, self.interval = output, interval
         self.parameters: list[tuple[str, torch.Tensor, dict[str, Any]]] = []
         self.names: list[str] = []
@@ -69,10 +69,16 @@ class ForecastDiagnosticsCallback(Callback):
         self.expected_squares: list[torch.Tensor] = []
         self.state_owners: list[Any] = []
         self.capture = False
+        self.spike_snapshot = spike_snapshot
+        self.snapshot_written = False
+        self.model: torch.nn.Module | None = None
+        self.before_model: dict[str, torch.Tensor] = {}
 
     def on_train_start(self, context: CallbackContext) -> None:
         """Resolve local optimizer shards and install observational forward hooks."""
         model = unwrap_model(context.model)[0]
+        self.model = model
+        self.snapshot_written = (self.output / "spike-before.pt").exists()
         optimizer = context.optimizer
         optimizers = getattr(optimizer, "chained_optimizers", [optimizer])
         groups = {id(p): group for opt in optimizers for group in opt.param_groups for p in group["params"]}
@@ -106,6 +112,8 @@ class ForecastDiagnosticsCallback(Callback):
         self.activations.clear()
         self.before = [p.detach().clone() for _, p, _ in self.parameters]
         self.hyperparameters = [(group["lr"], group["weight_decay"]) for _, _, group in self.parameters]
+        if self.spike_snapshot and not self.snapshot_written:
+            self.before_model = {name: p.detach().clone() for name, p in self.model.named_parameters()}
 
     @torch.no_grad()
     def on_train_step_end(self, context: CallbackContext) -> None:
@@ -117,6 +125,21 @@ class ForecastDiagnosticsCallback(Callback):
         grad_ratio = grad_norm / max(statistics.median(self.grad_history), 1e-30) if self.grad_history else 1.0
         loss_ratio = loss / max(statistics.median(self.loss_history), 1e-30) if self.loss_history else 1.0
         spike = len(self.grad_history) == 100 and (grad_ratio > 5 or loss_ratio > 1.2)
+        if spike and self.spike_snapshot and not self.snapshot_written:
+            if context.state.tensorboard_logger is not None:
+                torch.save(
+                    {
+                        "version": 1,
+                        "run": json.loads((self.output / "run.json").read_text()),
+                        "step": step - 1,
+                        "diagnostic_step": step,
+                        "consumed_samples_before_step": context.state.train_state.consumed_train_samples,
+                        "state_dict": {name: value.cpu() for name, value in self.before_model.items()},
+                    },
+                    self.output / "spike-before.pt",
+                )
+            self.snapshot_written = True
+        self.before_model.clear()
         self.grad_history.append(grad_norm)
         self.loss_history.append(loss)
         for i, ((_, p, _), (lr, wd)) in enumerate(zip(self.parameters, self.hyperparameters)):

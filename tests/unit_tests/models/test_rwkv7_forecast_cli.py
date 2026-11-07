@@ -29,6 +29,7 @@ def test_help_without_training_dependencies(monkeypatch, command):
         ["--eval-iters", "-1"],
         ["--exit-interval", "0"],
         ["--normalize-inputs"],
+        ["--spike-snapshot"],
     ],
 )
 def test_reject_invalid_training_inputs(monkeypatch, arguments):
