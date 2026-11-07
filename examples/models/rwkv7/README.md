@@ -4,6 +4,9 @@ RWKV-7 reuses transformers-rwkv model computation and FlashRWKV2 operators
 through Megatron Bridge's AutoBridge, ModelConfig, ModelBuilder, training loop,
 PEFT and distributed checkpoint interfaces.
 
+For continuous OHLCV next-bar training and autoregressive prediction from local
+Parquet data, see [Autoregressive minute OHLCV forecasting](forecast.md).
+
 ## Runtime
 
 Use this project's uv-managed environment and pinned Megatron-LM submodule.

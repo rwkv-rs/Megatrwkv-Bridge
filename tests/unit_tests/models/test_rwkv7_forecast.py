@@ -1,0 +1,96 @@
+"""Continuous task heads, state lifecycle, serialization and native loss counts."""
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+import torch
+import torch.nn.functional as F
+from transformers import RwkvConfig
+
+
+pytest.importorskip("transformers.integrations.flash_rwkv2", reason="Requires transformers-rwkv RWKV-7")
+
+from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import RWKV7ForecastConfig, RWKV7ForecastModel
+from megatron.bridge.recipes.rwkv7.forecast import forecast_loss, rwkv7_ohlcv_config
+
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.fixture
+def config(tmp_path):
+    return rwkv7_ohlcv_config(
+        RwkvConfig(hidden_size=64, num_hidden_layers=2, vocab_size=1, context_length=16),
+        data=tmp_path,
+        output=tmp_path,
+        steps=20,
+        micro_batch_size=1,
+        global_batch_size=2,
+        learning_rate=3e-4,
+        warmup_steps=1,
+        save_interval=10,
+        eval_interval=10,
+        eval_iters=0,
+        seed=2026,
+    ).model
+
+
+def test_config_checkpoint_and_parameter_contract(config):
+    restored = RWKV7ForecastConfig.from_dict(config.as_dict())
+    assert restored.get_builder_cls().model_class is RWKV7ForecastModel
+    model = RWKV7ForecastModel(config, None)
+    assert not any("embed_tokens" in name or "lm_head" in name for name, _ in model.named_parameters())
+    assert all(param.dtype == torch.bfloat16 for param in model.parameters())
+    other = RWKV7ForecastModel(restored, None)
+    other.load_state_dict(model.state_dict(), strict=True)
+    for name, value in other.state_dict().items():
+        torch.testing.assert_close(value, model.state_dict()[name], rtol=0, atol=0)
+
+
+def test_task_head_preserves_alignment_and_gradients(config):
+    model = RWKV7ForecastModel(config, None)
+    features = torch.randn(2, 8, 5)
+    labels = torch.randn(2, 8, 5)
+    with patch.object(
+        model.hf, "forward", side_effect=lambda **kwargs: SimpleNamespace(last_hidden_state=kwargs["inputs_embeds"])
+    ):
+        prediction = model(features)
+        loss = model(features, labels=labels)
+    assert prediction.dtype == loss.dtype == torch.float32
+    assert torch.all(prediction[..., 2:] > 0)
+    torch.testing.assert_close(loss, F.smooth_l1_loss(prediction, labels, reduction="none").mean(-1))
+    loss.mean().backward()
+    assert model.input_projection.weight.grad.abs().sum() > 0
+    assert model.output_projection.weight.grad.abs().sum() > 0
+
+
+def test_generate_feeds_predictions_back_and_resets_state(config):
+    model = RWKV7ForecastModel(config, None).eval()
+    calls, caches = [], []
+
+    def forward(features, labels=None, *, past_key_values=None):
+        calls.append(features.clone())
+        caches.append(past_key_values)
+        return features.float() + 0.25
+
+    history = torch.ones(1, 8, 5)
+    with patch.object(model, "forward", side_effect=forward):
+        result = model.generate(history, horizon=3)
+        model.generate(history, horizon=1)
+    assert [x.shape[1] for x in calls] == [8, 1, 1, 8]
+    torch.testing.assert_close(calls[1], result[:, :1])
+    torch.testing.assert_close(calls[2], result[:, 1:2])
+    assert caches[0] is caches[1] is caches[2]
+    assert caches[0] is not caches[3]
+    torch.testing.assert_close(result[0, :, 0], torch.tensor([1.25, 1.5, 1.75]))
+
+
+def test_native_loss_counts_bars_not_channels():
+    losses = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+    with patch("megatron.bridge.recipes.rwkv7.forecast.validate_local_loss"):
+        loss, count, report = forecast_loss(losses, check_for_nan_in_loss=True, check_for_spiky_loss=False)
+    assert loss.item() == 10 and count.item() == 4
+    torch.testing.assert_close(report["ohlcv huber"], torch.tensor([10.0, 4.0]))
+    (loss / count).backward()
+    torch.testing.assert_close(losses.grad, torch.full_like(losses, 0.25))

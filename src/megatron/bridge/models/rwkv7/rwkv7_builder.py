@@ -13,6 +13,8 @@ from megatron.bridge.models.rwkv7.modeling_rwkv7 import RWKV7Model
 class RWKV7ModelBuilder(GPTModelBuilder):
     """Build complete RWKV replicas, with standard hooks and DP wrapping."""
 
+    model_class = RWKV7Model
+
     def build_model(
         self,
         pg_collection: ProcessGroupCollection,
@@ -37,4 +39,4 @@ class RWKV7ModelBuilder(GPTModelBuilder):
             torch.device("cpu") if cfg.use_cpu_initialization else torch.device("cuda", torch.cuda.current_device())
         )
         with device:
-            return RWKV7Model(cfg, pg_collection)
+            return self.model_class(cfg, pg_collection)
