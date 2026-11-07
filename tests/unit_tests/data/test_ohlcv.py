@@ -158,6 +158,19 @@ def test_multi_instrument_index_and_mmap_switching(prepared):
         assert isinstance(arrays["features"], np.memmap)
 
 
+def test_parallel_preparation_matches_serial(prepared):
+    source, serial = prepared
+    parallel = serial.parent / "parallel"
+    result = prepare_ohlcv(
+        source, parallel, train_end="2024-01-01", validation_end="2025-01-01", revision="test-revision", workers=2
+    )
+    assert result == json.loads((serial / "manifest.json").read_text())
+    for name in ("features", "close", "timestamps", "segments"):
+        np.testing.assert_array_equal(
+            np.load(parallel / "SZ/000001" / f"{name}.npy"), np.load(serial / "SZ/000001" / f"{name}.npy")
+        )
+
+
 def test_reject_unsorted_or_mixed_instrument_parquet(tmp_path):
     file = tmp_path / "bad.parquet"
     values = {name: [10, 10] for name in OHLCV_COLUMNS}

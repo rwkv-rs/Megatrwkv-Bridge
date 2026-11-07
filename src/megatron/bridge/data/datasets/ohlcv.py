@@ -6,8 +6,13 @@
 import bisect
 import hashlib
 import json
+import logging
 import math
+import multiprocessing
 import random
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 from typing import TypedDict
 
@@ -21,6 +26,7 @@ FEATURE_NAMES = ("open_return", "close_return", "upper_wick", "lower_wick", "log
 SPLITS = ("train", "validation", "test")
 PRICE_SCALE = 100.0
 VOLUME_SCALE = 10.0
+logger = logging.getLogger(__name__)
 
 
 class InstrumentInfo(TypedDict):
@@ -168,6 +174,7 @@ def prepare_ohlcv(
     train_end: str,
     validation_end: str,
     revision: str,
+    workers: int = 1,
 ) -> OHLCVManifest:
     """Prepare all canonical instrument files into per-instrument mmap shards.
 
@@ -180,6 +187,8 @@ def prepare_ohlcv(
         raise ValueError("Expected train_end < validation_end as ISO dates.")
     if not revision.strip():
         raise ValueError("Record the source dataset revision.")
+    if workers <= 0:
+        raise ValueError("workers must be positive.")
     paths = sorted(source.glob("data/stock_1m/*/*.parquet"))
     if not paths:
         raise ValueError("Expected a snapshot root containing data/stock_1m/{exchange}/{symbol}.parquet.")
@@ -196,62 +205,68 @@ def prepare_ohlcv(
         "instruments": [],
         "splits": {split: {"segments": 0, "bars": 0} for split in SPLITS},
     }
-    instruments = set()
-    for path in paths:
-        exchange, symbol, timestamps, bars = load_instrument(path)
-        if (exchange, symbol) in instruments:
-            raise ValueError(f"Duplicate canonical instrument: {exchange}/{symbol}.")
-        instruments.add((exchange, symbol))
-        chunks, closes, times, segments = [], [], [], []
-        offset = 0
-        relative = f"{exchange}/{symbol}"
-        for start, end in contiguous_segments(timestamps, bars):
-            # Cut before encoding so neither context nor labels cross a split.
-            boundaries = [start]
-            for boundary in (train_boundary, validation_boundary):
-                index = int(np.searchsorted(timestamps, boundary))
-                if start < index < end:
-                    boundaries.append(index)
-            boundaries.append(end)
-            for left, right in zip(boundaries[:-1], boundaries[1:]):
-                if right - left < 3:
-                    continue
-                features = encode_bars(bars[left:right])
-                split = (
-                    "train"
-                    if timestamps[left] < train_boundary
-                    else "validation"
-                    if timestamps[left] < validation_boundary
-                    else "test"
-                )
-                segments.append((offset, len(features), SPLITS.index(split)))
-                manifest["splits"][split]["segments"] += 1
-                manifest["splits"][split]["bars"] += len(features)
-                chunks.append(features)
-                closes.append(bars[left + 1 : right, 3])
-                times.append(timestamps[left + 1 : right])
-                offset += len(features)
-        if chunks:
-            directory = output / relative
-            directory.mkdir(parents=True, exist_ok=True)
-            np.save(directory / "features.npy", np.concatenate(chunks))
-            np.save(directory / "close.npy", np.concatenate(closes))
-            np.save(directory / "timestamps.npy", np.concatenate(times))
-            np.save(directory / "segments.npy", np.asarray(segments, dtype=np.int64))
-            manifest["instruments"].append(
-                {
-                    "path": relative,
-                    "exchange": exchange,
-                    "symbol": symbol,
-                    "bars": offset,
-                    "start": str(times[0][0]),
-                    "end": str(times[-1][-1]),
-                }
-            )
+    worker = partial(
+        _prepare_instrument, output=output, train_boundary=train_boundary, validation_boundary=validation_boundary
+    )
+    pool = (
+        ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"))
+        if workers > 1
+        else nullcontext()
+    )
+    with pool as executor:
+        results = executor.map(worker, paths, chunksize=1) if executor is not None else map(worker, paths)
+        for count, (instrument, splits) in enumerate(results, start=1):
+            if instrument is not None:
+                manifest["instruments"].append(instrument)
+            for split in SPLITS:
+                manifest["splits"][split]["segments"] += splits[split]["segments"]
+                manifest["splits"][split]["bars"] += splits[split]["bars"]
+            if count % 100 == 0 or count == len(paths):
+                logger.info("Prepared %d/%d instruments", count, len(paths))
     if not manifest["instruments"]:
         raise ValueError("No valid contiguous bars found.")
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
+
+
+def _prepare_instrument(
+    path: Path, *, output: Path, train_boundary: np.datetime64, validation_boundary: np.datetime64
+) -> tuple[InstrumentInfo | None, dict[str, SplitCounts]]:
+    exchange, symbol, timestamps, bars = load_instrument(path)
+    if exchange != path.parent.name or symbol != path.stem:
+        raise ValueError(f"Canonical path does not match its instrument identity: {path}.")
+    chunks, closes, times, segments = [], [], [], []
+    splits: dict[str, SplitCounts] = {split: {"segments": 0, "bars": 0} for split in SPLITS}
+    offset = 0
+    # These indices are constant for all intraday segments in an instrument.
+    split_indices = [int(np.searchsorted(timestamps, boundary)) for boundary in (train_boundary, validation_boundary)]
+    for start, end in contiguous_segments(timestamps, bars):
+        boundaries = [start, *(index for index in split_indices if start < index < end), end]
+        for left, right in zip(boundaries[:-1], boundaries[1:]):
+            if right - left < 3:
+                continue
+            features = encode_bars(bars[left:right])
+            split_index = int(timestamps[left] >= train_boundary) + int(timestamps[left] >= validation_boundary)
+            split = SPLITS[split_index]
+            segments.append((offset, len(features), split_index))
+            splits[split]["segments"] += 1
+            splits[split]["bars"] += len(features)
+            chunks.append(features)
+            closes.append(bars[left + 1 : right, 3])
+            times.append(timestamps[left + 1 : right])
+            offset += len(features)
+    if not chunks:
+        return None, splits
+    relative = f"{exchange}/{symbol}"
+    directory = output / relative
+    directory.mkdir(parents=True, exist_ok=False)
+    np.save(directory / "features.npy", np.concatenate(chunks))
+    np.save(directory / "close.npy", np.concatenate(closes))
+    np.save(directory / "timestamps.npy", np.concatenate(times))
+    np.save(directory / "segments.npy", np.asarray(segments, dtype=np.int64))
+    return InstrumentInfo(
+        path=relative, exchange=exchange, symbol=symbol, bars=offset, start=str(times[0][0]), end=str(times[-1][-1])
+    ), splits
 
 
 class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):

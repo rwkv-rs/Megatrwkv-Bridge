@@ -32,6 +32,7 @@ def prepare(args: argparse.Namespace) -> None:
         train_end=args.train_end,
         validation_end=args.validation_end,
         revision=args.revision,
+        workers=args.workers,
     )
     for split in ("train", "validation", "test"):
         counts = manifest["splits"][split]
@@ -245,6 +246,7 @@ def main() -> None:
     prep.add_argument("--train-end", required=True, help="Exclusive local date, YYYY-MM-DD")
     prep.add_argument("--validation-end", required=True, help="Exclusive local date, YYYY-MM-DD")
     prep.add_argument("--revision", required=True, help="Downloaded Hugging Face dataset commit SHA")
+    prep.add_argument("--workers", type=int, default=1, help="Parallel per-instrument preprocessing workers")
     prep.set_defaults(handler=prepare)
     training = commands.add_parser("train", help="Train from scratch with native Bridge checkpoints")
     training.add_argument("--config", type=Path, required=True)

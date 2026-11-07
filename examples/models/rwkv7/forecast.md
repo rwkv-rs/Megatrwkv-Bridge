@@ -38,7 +38,7 @@ Prepare a **new** destination, with exclusive chronological split boundaries:
 timeout 24h uv run --no-sync python examples/models/rwkv7/forecast.py prepare \
   --source SNAPSHOT --output DATA/ashare-ohlcv \
   --train-end 2024-01-01 --validation-end 2025-01-01 \
-  --revision DATASET_COMMIT_SHA
+  --revision DATASET_COMMIT_SHA --workers 8
 ```
 
 Training uses dates before 2024-01-01; validation uses 2024; test uses dates
@@ -48,7 +48,7 @@ targets remain inside one split, instrument and continuous session. Independent
 windows reset all recurrent state. Context length is measured in minute bars;
 64 is a small initial setting that fits within a continuous session.
 
-Preparation processes one instrument at a time and writes float32 encoded
+Preparation processes one instrument per worker and writes float32 encoded
 features, float64 closing prices and timestamps as memory-mapped NumPy shards.
 These uncompressed arrays need roughly 36 bytes per retained bar, plus the
 segment manifest (about 125 GB for 3.48 billion bars). Use a smaller instrument
