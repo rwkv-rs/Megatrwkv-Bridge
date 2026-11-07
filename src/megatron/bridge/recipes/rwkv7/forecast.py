@@ -63,6 +63,7 @@ class OHLCVDatasetConfig(DatasetProvider):
     seed: int
     dataloader_type: Literal["single"] = "single"
     epochs: int | None = None
+    evaluation_samples: int | None = None
 
     def build_datasets(
         self, context: DatasetBuildContext
@@ -79,10 +80,11 @@ class OHLCVDatasetConfig(DatasetProvider):
                     split=split,
                     seq_length=self.seq_length,
                     target_length=count,
-                    seed=self.seed if split == "train" else None,
+                    seed=self.seed if split == "train" else self.seed + 1,
                     stride=self.seq_length if self.epochs is not None else 1,
                     keep_tail=self.epochs is not None,
                     epochs=self.epochs if split == "train" else None,
+                    cycle_length=self.evaluation_samples if split != "train" else None,
                 )
                 if count > 0
                 else None
@@ -115,7 +117,13 @@ def rwkv7_ohlcv_config(
     cfg = rwkv7_pretrain_config(hf_config)
     base = cfg.model
     cfg.model = RWKV7ForecastConfig(**{field.name: getattr(base, field.name) for field in fields(base) if field.init})
-    cfg.dataset = OHLCVDatasetConfig(root=str(data), seq_length=hf_config.context_length, seed=seed, epochs=epochs)
+    cfg.dataset = OHLCVDatasetConfig(
+        root=str(data),
+        seq_length=hf_config.context_length,
+        seed=seed,
+        epochs=epochs,
+        evaluation_samples=global_batch_size * eval_iters if eval_iters else None,
+    )
     cfg.model.calculate_per_token_loss = True
     cfg.ddp.average_in_collective = False
     cfg.train.train_iters = steps
@@ -140,13 +148,18 @@ def forecast_loss(
     check_for_nan_in_loss: bool,
     check_for_spiky_loss: bool,
     loss_mask: torch.Tensor | None = None,
+    channel_losses: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Return summed per-bar loss and counts for native DP normalization."""
     mask = torch.ones_like(output) if loss_mask is None else loss_mask
     loss = (output.float() * mask).sum()
     validate_local_loss(loss, check_for_nan_in_loss=check_for_nan_in_loss, check_for_spiky_loss=check_for_spiky_loss)
     count = mask.sum().detach().to(torch.int)
-    return loss, count, {"ohlcv huber": torch.stack((loss.detach(), count.float()))}
+    report = {"ohlcv huber": torch.stack((loss.detach(), count.float()))}
+    if channel_losses is not None:
+        for i, name in enumerate(("open", "close", "upper_wick", "lower_wick", "volume")):
+            report[f"ohlcv/{name}"] = torch.stack(((channel_losses[..., i] * mask).sum(), count.float()))
+    return loss, count, report
 
 
 def forecast_forward_step(
@@ -156,12 +169,13 @@ def forecast_forward_step(
     batch = next(data_iterator)
     features = batch["features"].cuda(non_blocking=True)
     labels = batch["labels"].cuda(non_blocking=True)
-    output = model(features=features, labels=labels)
-    return output, partial(
+    output = model(features=features, labels=labels, return_channel_losses=True)
+    return output.mean(-1), partial(
         forecast_loss,
         check_for_nan_in_loss=state.cfg.rerun_state_machine.check_for_nan_in_loss,
         check_for_spiky_loss=state.cfg.rerun_state_machine.check_for_spiky_loss,
         loss_mask=batch["loss_mask"].cuda(non_blocking=True),
+        channel_losses=output.detach(),
     )
 
 

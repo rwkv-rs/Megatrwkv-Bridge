@@ -104,3 +104,47 @@ def test_tail_and_dummy_samples_do_not_contribute_loss_or_gradients():
     assert loss.item() == 3 and count.item() == 2
     (loss / count).backward()
     torch.testing.assert_close(losses.grad, mask / 2)
+
+
+def test_calibrated_head_has_training_prior_and_fp32_output(config):
+    config.hf_config.update(
+        forecast_initialization="calibrated",
+        forecast_target_mean=[0.0, 0.0, 0.03, 0.04, 0.85],
+        forecast_head_gain=0.01,
+        forecast_head_fp32=True,
+    )
+    model = RWKV7ForecastModel(config, None)
+    hidden = torch.zeros(2, 8, config.hidden_size, dtype=torch.bfloat16)
+    with patch.object(model.hf, "forward", return_value=SimpleNamespace(last_hidden_state=hidden)):
+        prediction = model(torch.zeros(2, 8, 5))
+    torch.testing.assert_close(prediction[0, 0], torch.tensor([0.0, 0.0, 0.03, 0.04, 0.85]), atol=0.003, rtol=0.01)
+    assert torch.count_nonzero(model.input_projection.bias) == 0
+    assert prediction.dtype == torch.float32
+
+
+def test_adamw_update_metrics_exclude_lr_and_decoupled_decay():
+    from megatron.bridge.recipes.rwkv7.forecast_diagnostics import adamw_update_direction, tensor_statistics
+
+    before = torch.tensor([0.2, -0.4], dtype=torch.float32)
+    direction = torch.tensor([0.3, -0.1])
+    after = before - 0.01 * (direction + 0.1 * before)
+    recovered = adamw_update_direction(before, after, lr=0.01, weight_decay=0.1)
+    torch.testing.assert_close(recovered, direction)
+    stats = tensor_statistics(torch.tensor([3.0, -4.0]))
+    torch.testing.assert_close(stats, torch.tensor([25.0, 2.0, 4.0]))
+
+
+def test_channel_losses_use_identical_mask_and_valid_count():
+    channels = torch.arange(20, dtype=torch.float32).reshape(1, 4, 5)
+    mask = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+    with patch("megatron.bridge.recipes.rwkv7.forecast.validate_local_loss"):
+        _, count, report = forecast_loss(
+            channels.mean(-1),
+            loss_mask=mask,
+            channel_losses=channels,
+            check_for_nan_in_loss=True,
+            check_for_spiky_loss=False,
+        )
+    assert count == 2
+    assert report["ohlcv/open"].tolist() == [5.0, 2.0]
+    assert report["ohlcv/volume"].tolist() == [13.0, 2.0]

@@ -131,6 +131,22 @@ def test_seeded_traversal_is_bijective_and_resumable(prepared):
         np.testing.assert_array_equal(first[index]["labels"], first[index + first.num_windows]["labels"])
 
 
+def test_fixed_evaluation_cycle_reuses_identical_windows(prepared):
+    _, output = prepared
+    dataset = OHLCVWindowDataset(
+        output,
+        split="train",
+        seq_length=2,
+        stride=2,
+        keep_tail=True,
+        seed=42,
+        cycle_length=3,
+    )
+    for i in range(3):
+        for key in ("features", "labels", "loss_mask"):
+            np.testing.assert_array_equal(dataset[i][key], dataset[i + 3][key])
+
+
 def test_free_running_window_reserves_entire_horizon(prepared):
     _, output = prepared
     dataset = OHLCVWindowDataset(output, split="test", seq_length=3, horizon=3, stride=2)

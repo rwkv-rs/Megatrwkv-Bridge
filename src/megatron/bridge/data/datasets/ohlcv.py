@@ -290,6 +290,7 @@ class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):
         seed: int | None = None,
         keep_tail: bool = False,
         epochs: int | None = None,
+        cycle_length: int | None = None,
     ) -> None:
         if seq_length <= 0 or horizon <= 0 or stride <= 0:
             raise ValueError("seq_length, horizon and stride must be positive.")
@@ -299,6 +300,7 @@ class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):
         if epochs is not None and epochs <= 0:
             raise ValueError("epochs must be positive.")
         self.keep_tail, self.epochs = keep_tail, epochs
+        self.cycle_length = cycle_length
         manifest: OHLCVManifest = json.loads((self.root / "manifest.json").read_text())
         if (
             manifest["version"] != 1
@@ -351,6 +353,8 @@ class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):
 
     def window(self, index: int) -> tuple[WindowInfo, int, ShardArrays]:
         """Locate a window and mmap its instrument; retain only one open shard."""
+        if self.cycle_length is not None:
+            index %= self.cycle_length
         index = (index * self.multiplier + self.offset) % self.num_windows
         instrument_index = bisect.bisect_right(self.cumulative, index)
         instrument = self.instruments[instrument_index]

@@ -44,6 +44,19 @@ class RWKV7ForecastModel(RWKV7Model):
         self.hf.embed_tokens = nn.Identity()
         self.input_projection = nn.Linear(5, model_config.hidden_size, dtype=torch.bfloat16)
         self.output_projection = nn.Linear(model_config.hidden_size, 5, dtype=torch.bfloat16)
+        if getattr(self.hf.config, "forecast_initialization", "linear") == "calibrated":
+            # Initialize in FP32 before rounding, as in RWKV-LM's generated weights.
+            with torch.no_grad():
+                weight = torch.empty_like(self.input_projection.weight, dtype=torch.float32)
+                nn.init.orthogonal_(weight, gain=(model_config.hidden_size / 5) ** 0.5)
+                self.input_projection.weight.copy_(weight)
+                self.input_projection.bias.zero_()
+                weight = torch.empty_like(self.output_projection.weight, dtype=torch.float32)
+                nn.init.orthogonal_(weight, gain=self.hf.config.forecast_head_gain)
+                self.output_projection.weight.copy_(weight)
+                bias = torch.tensor(self.hf.config.forecast_target_mean, dtype=torch.float32)
+                bias[2:] = bias[2:] + torch.log(-torch.expm1(-bias[2:]))
+                self.output_projection.bias.copy_(bias)
 
     def forward(
         self,
@@ -51,6 +64,7 @@ class RWKV7ForecastModel(RWKV7Model):
         labels: torch.Tensor | None = None,
         *,
         past_key_values: Any = None,
+        return_channel_losses: bool = False,
     ) -> torch.Tensor:
         """Return encoded predictions or FP32 per-bar Huber losses.
 
@@ -64,12 +78,16 @@ class RWKV7ForecastModel(RWKV7Model):
             past_key_values=past_key_values,
             use_cache=past_key_values is not None,
         ).last_hidden_state
-        raw = self.output_projection(hidden).float()
+        if getattr(self.hf.config, "forecast_head_fp32", False):
+            raw = F.linear(hidden.float(), self.output_projection.weight.float(), self.output_projection.bias.float())
+        else:
+            raw = self.output_projection(hidden).float()
         # Positive wicks guarantee high >= max(open, close), low <= min(open, close).
         prediction = torch.cat((raw[..., :2], F.softplus(raw[..., 2:])), dim=-1)
         if labels is None:
             return prediction
-        return F.smooth_l1_loss(prediction, labels.float(), reduction="none").mean(dim=-1)
+        channel_losses = F.smooth_l1_loss(prediction, labels.float(), reduction="none")
+        return channel_losses if return_channel_losses else channel_losses.mean(dim=-1)
 
     @torch.inference_mode()
     def generate(self, context: torch.Tensor, *, horizon: int) -> torch.Tensor:

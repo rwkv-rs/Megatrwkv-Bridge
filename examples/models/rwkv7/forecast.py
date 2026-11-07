@@ -59,6 +59,28 @@ def train(args: argparse.Namespace) -> None:
     # Forecasting starts from scratch and discards the language embedding/head.
     hf.vocab_size = 1
     hf.tie_word_embeddings = False
+    if args.calibration_windows:
+        import numpy as np
+
+        calibration = OHLCVWindowDataset(
+            args.data,
+            split="train",
+            seq_length=args.context,
+            stride=args.context,
+            keep_tail=True,
+            seed=args.seed,
+        )
+        total, count = np.zeros(5, dtype=np.float64), 0
+        for i in range(args.calibration_windows):
+            sample = calibration[i * calibration.num_windows // args.calibration_windows]
+            mask = sample["loss_mask"].astype(bool)
+            total += sample["labels"][mask].sum(axis=0, dtype=np.float64)
+            count += int(mask.sum())
+        hf.forecast_initialization = "calibrated"
+        hf.forecast_target_mean = (total / count).tolist()
+        hf.forecast_head_gain = args.head_gain
+        logger.info("Training-only head calibration (%d bars): %s", count, hf.forecast_target_mean)
+    hf.forecast_head_fp32 = args.head_fp32
     # Count actual windows before resolving an epoch-based optimizer-step budget.
     for split in ("train", "validation", "test") if args.eval_iters else ("train",):
         dataset = OHLCVWindowDataset(
@@ -117,7 +139,12 @@ def train(args: argparse.Namespace) -> None:
     )
     cfg.checkpoint.load = str(args.resume) if args.resume else None
     cfg.train.exit_interval = args.exit_interval
-    pretrain(cfg, forecast_forward_step, callbacks=[ForecastExportCallback(args.output, run=run)])
+    callbacks = [ForecastExportCallback(args.output, run=run)]
+    if args.diagnostics_interval:
+        from megatron.bridge.recipes.rwkv7.forecast_diagnostics import ForecastDiagnosticsCallback
+
+        callbacks.append(ForecastDiagnosticsCallback(args.output, interval=args.diagnostics_interval))
+    pretrain(cfg, forecast_forward_step, callbacks=callbacks)
 
 
 def load_forecaster(checkpoint: Path) -> tuple[RWKV7ForecastModel, ForecastCheckpoint]:
@@ -282,6 +309,12 @@ def main() -> None:
     training.add_argument("--seed", type=int, default=1234)
     training.add_argument("--resume", type=Path)
     training.add_argument("--exit-interval", type=int, help="Native bounded exit, retaining the full LR schedule")
+    training.add_argument(
+        "--calibration-windows", type=int, default=0, help="Training windows for head initialization"
+    )
+    training.add_argument("--head-gain", type=float, default=0.01, help="Orthogonal gain of the calibrated head")
+    training.add_argument("--head-fp32", action="store_true", help="Compute the continuous output projection in FP32")
+    training.add_argument("--diagnostics-interval", type=int, default=0, help="Module/activation metrics interval")
     training.set_defaults(handler=train)
     prediction = commands.add_parser("predict", help="Autoregressively generate future OHLCV bars")
     prediction.add_argument("--checkpoint", type=Path, required=True)
@@ -315,6 +348,9 @@ def main() -> None:
             )
             or args.eval_iters < 0
             or args.warmup_steps < 0
+            or args.calibration_windows < 0
+            or args.head_gain <= 0
+            or args.diagnostics_interval < 0
             or (args.steps is not None and (args.steps <= 0 or args.warmup_steps >= args.steps))
             or (args.epochs is not None and args.epochs <= 0)
         ):
