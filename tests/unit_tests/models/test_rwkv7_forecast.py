@@ -163,3 +163,38 @@ def test_channel_losses_use_identical_mask_and_valid_count():
     assert count == 2
     assert report["ohlcv/open"].tolist() == [5.0, 2.0]
     assert report["ohlcv/volume"].tolist() == [13.0, 2.0]
+
+
+@pytest.mark.parametrize(
+    "name,shape,wd_mult,lr_mult",
+    [
+        ("hf.layers.1.linear_attn.k_a", (1, 1, 64), 0.0, 1.0),
+        ("hf.layers.1.linear_attn.w0", (1, 1, 64), 0.0, 2.0),
+        ("hf.layers.1.linear_attn.w1", (64, 32), 0.0, 1.0),
+        ("hf.layers.1.linear_attn.r_k", (1, 64), 0.0, 1.0),
+        ("hf.layers.1.linear_attn.g_norm.weight", (64,), 0.0, 1.0),
+        ("hf.layers.1.linear_attn.k_proj.weight", (64, 64), 1.0, 1.0),
+        ("output_projection.weight", (5, 64), 1.0, 1.0),
+        ("output_projection.bias", (5,), 0.0, 1.0),
+    ],
+)
+def test_rwkv_optimizer_group_policy(name, shape, wd_mult, lr_mult):
+    from megatron.bridge.recipes.rwkv7.forecast import RWKV7ForecastOptimizerOverrides
+    from megatron.bridge.training.config import (
+        OptimizerConfig,
+        OptimizerConfigOverrideProviderContext,
+        SchedulerConfig,
+    )
+
+    context = OptimizerConfigOverrideProviderContext(
+        model=None,
+        optimizer_config=OptimizerConfig(),
+        scheduler_config=SchedulerConfig(),
+    )
+    overrides = RWKV7ForecastOptimizerOverrides().build_config_overrides(context)
+    parameter = torch.nn.Parameter(torch.empty(shape))
+    matching = [value for key, value in overrides.items() if key.matches(parameter, name)]
+    assert all(value.get("wd_mult", wd_mult) == wd_mult for value in matching)
+    assert all(value.get("lr_mult", lr_mult) == lr_mult for value in matching)
+    assert any(value.get("wd_mult") == 0.0 for value in matching) == (wd_mult == 0.0)
+    assert any(value.get("lr_mult") == 2.0 for value in matching) == (lr_mult == 2.0)

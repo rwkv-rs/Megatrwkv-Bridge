@@ -217,6 +217,14 @@ channels. `--head-fp32` computes the final projection in FP32 while retaining
 BF16 parameter storage and the existing RWKV backbone precision. These choices
 are persisted in the HF configuration in `run.json` and exported checkpoints.
 
+`--rwkv-optimizer` selects RWKV-LM's parameter groups: only matrix parameters
+whose names end in `.weight` receive weight decay; TimeMix vectors, low-rank
+factors and biases do not. The `w0` decay logits use twice the base learning rate.
+This follows the reference's `configure_optimizers`, rather than treating a
+`[1, 1, hidden]` TimeMix vector as a decay-eligible matrix. The policy is persisted
+as `forecast_optimizer` and must be evaluated in a separate run because it
+changes optimizer groups and training semantics.
+
 Training validation now repeats a fixed, seeded selection of holdout windows
 at every evaluation. This separates model changes from changes in evaluation
 stocks and times. Evaluation still covers a subset; free-running metrics use

@@ -82,6 +82,8 @@ def train(args: argparse.Namespace) -> None:
         logger.info("Training-only head calibration (%d bars): %s", count, hf.forecast_target_mean)
     if args.head_fp32:
         hf.forecast_head_fp32 = True
+    if args.rwkv_optimizer:
+        hf.forecast_optimizer = "rwkv_lm"
     # Count actual windows before resolving an epoch-based optimizer-step budget.
     for split in ("train", "validation", "test") if args.eval_iters else ("train",):
         dataset = OHLCVWindowDataset(
@@ -315,6 +317,9 @@ def main() -> None:
     )
     training.add_argument("--head-gain", type=float, default=0.01, help="Orthogonal gain of the calibrated head")
     training.add_argument("--head-fp32", action="store_true", help="Compute the continuous output projection in FP32")
+    training.add_argument(
+        "--rwkv-optimizer", action="store_true", help="Use RWKV-LM matrix-only decay and 2x w0 learning rate"
+    )
     training.add_argument("--diagnostics-interval", type=int, default=0, help="Module/activation metrics interval")
     training.set_defaults(handler=train)
     prediction = commands.add_parser("predict", help="Autoregressively generate future OHLCV bars")

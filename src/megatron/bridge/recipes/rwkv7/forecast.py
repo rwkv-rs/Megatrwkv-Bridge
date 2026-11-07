@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Iterator, Literal, TypedDict
 
 import torch
+from megatron.core.optimizer import ParamKey, ParamWithNamePredicate
+from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from transformers import RwkvConfig
 
 from megatron.bridge.data.base import DatasetBuildContext, DatasetProvider
@@ -19,12 +21,34 @@ from megatron.bridge.models.conversion.utils import unwrap_model
 from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import RWKV7ForecastConfig
 from megatron.bridge.recipes.rwkv7.rwkv7 import rwkv7_pretrain_config
 from megatron.bridge.training.callbacks import Callback, CallbackContext
-from megatron.bridge.training.config import ConfigContainer
+from megatron.bridge.training.config import (
+    ConfigContainer,
+    OptimizerConfigOverrideProvider,
+    OptimizerConfigOverrideProviderContext,
+)
 from megatron.bridge.training.losses import validate_local_loss
 from megatron.bridge.training.state import GlobalState
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RWKV7ForecastOptimizerOverrides(OptimizerConfigOverrideProvider):
+    """Match RWKV-LM's matrix-only decay and doubled decay-logit learning rate."""
+
+    def build_config_overrides(
+        self, context: OptimizerConfigOverrideProviderContext
+    ) -> dict[ParamKey, ParamGroupOverride]:
+        """Exclude TimeMix vectors and low-rank factors from weight decay."""
+        overrides = super().build_config_overrides(context) or {}
+        no_decay = ParamWithNamePredicate(
+            name="rwkv7_forecast_non_matrix_weight",
+            fn=lambda parameter, name: not (name.endswith(".weight") and parameter.squeeze().ndim >= 2),
+        )
+        overrides[ParamKey(with_name_predicate=no_decay)] = ParamGroupOverride(wd_mult=0.0)
+        overrides[ParamKey(name="*.linear_attn.w0")] = ParamGroupOverride(lr_mult=2.0)
+        return overrides
 
 
 class ForecastRun(TypedDict):
@@ -131,6 +155,8 @@ def rwkv7_ohlcv_config(
     cfg.train.global_batch_size = global_batch_size
     cfg.optimizer.lr = learning_rate
     cfg.optimizer.min_lr = learning_rate * 0.1
+    if getattr(hf_config, "forecast_optimizer", "megatron") == "rwkv_lm":
+        cfg.optimizer_config_override_provider = RWKV7ForecastOptimizerOverrides()
     cfg.scheduler.lr_warmup_iters = warmup_steps
     cfg.scheduler.lr_decay_iters = steps
     cfg.validation.eval_interval = eval_interval
