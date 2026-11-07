@@ -28,6 +28,7 @@ class ForecastRun(TypedDict):
     hf_config: dict[str, Any]
     manifest_sha256: str
     steps: int
+    epochs: int | None
     global_batch_size: int
     micro_batch_size: int
     learning_rate: float
@@ -56,6 +57,7 @@ class OHLCVDatasetConfig(DatasetProvider):
     seq_length: int
     seed: int
     dataloader_type: Literal["single"] = "single"
+    epochs: int | None = None
 
     def build_datasets(
         self, context: DatasetBuildContext
@@ -73,6 +75,9 @@ class OHLCVDatasetConfig(DatasetProvider):
                     seq_length=self.seq_length,
                     target_length=count,
                     seed=self.seed if split == "train" else None,
+                    stride=self.seq_length if self.epochs is not None else 1,
+                    keep_tail=self.epochs is not None,
+                    epochs=self.epochs if split == "train" else None,
                 )
                 if count > 0
                 else None
@@ -94,6 +99,7 @@ def rwkv7_ohlcv_config(
     eval_interval: int,
     eval_iters: int,
     seed: int,
+    epochs: int | None = None,
 ) -> ConfigContainer:
     """Build an early, unoptimized continuous RWKV7 training experiment.
 
@@ -104,7 +110,9 @@ def rwkv7_ohlcv_config(
     cfg = rwkv7_pretrain_config(hf_config)
     base = cfg.model
     cfg.model = RWKV7ForecastConfig(**{field.name: getattr(base, field.name) for field in fields(base) if field.init})
-    cfg.dataset = OHLCVDatasetConfig(root=str(data), seq_length=hf_config.context_length, seed=seed)
+    cfg.dataset = OHLCVDatasetConfig(root=str(data), seq_length=hf_config.context_length, seed=seed, epochs=epochs)
+    cfg.model.calculate_per_token_loss = True
+    cfg.ddp.average_in_collective = False
     cfg.train.train_iters = steps
     cfg.train.micro_batch_size = micro_batch_size
     cfg.train.global_batch_size = global_batch_size
@@ -122,12 +130,17 @@ def rwkv7_ohlcv_config(
 
 
 def forecast_loss(
-    output: torch.Tensor, *, check_for_nan_in_loss: bool, check_for_spiky_loss: bool
+    output: torch.Tensor,
+    *,
+    check_for_nan_in_loss: bool,
+    check_for_spiky_loss: bool,
+    loss_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Return summed per-bar loss and counts for native DP normalization."""
-    loss = output.float().sum()
+    mask = torch.ones_like(output) if loss_mask is None else loss_mask
+    loss = (output.float() * mask).sum()
     validate_local_loss(loss, check_for_nan_in_loss=check_for_nan_in_loss, check_for_spiky_loss=check_for_spiky_loss)
-    count = torch.tensor(output.numel(), device=output.device, dtype=torch.int)
+    count = mask.sum().detach().to(torch.int)
     return loss, count, {"ohlcv huber": torch.stack((loss.detach(), count.float()))}
 
 
@@ -143,6 +156,7 @@ def forecast_forward_step(
         forecast_loss,
         check_for_nan_in_loss=state.cfg.rerun_state_machine.check_for_nan_in_loss,
         check_for_spiky_loss=state.cfg.rerun_state_machine.check_for_spiky_loss,
+        loss_mask=batch["loss_mask"].cuda(non_blocking=True),
     )
 
 

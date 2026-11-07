@@ -94,3 +94,13 @@ def test_native_loss_counts_bars_not_channels():
     torch.testing.assert_close(report["ohlcv huber"], torch.tensor([10.0, 4.0]))
     (loss / count).backward()
     torch.testing.assert_close(losses.grad, torch.full_like(losses, 0.25))
+
+
+def test_tail_and_dummy_samples_do_not_contribute_loss_or_gradients():
+    losses = torch.tensor([[1.0, 2.0, 100.0], [200.0, 300.0, 400.0]], requires_grad=True)
+    mask = torch.tensor([[1.0, 1.0, 0.0], [0.0, 0.0, 0.0]])
+    with patch("megatron.bridge.recipes.rwkv7.forecast.validate_local_loss"):
+        loss, count, _ = forecast_loss(losses, loss_mask=mask, check_for_nan_in_loss=True, check_for_spiky_loss=False)
+    assert loss.item() == 3 and count.item() == 2
+    (loss / count).backward()
+    torch.testing.assert_close(losses.grad, mask / 2)

@@ -113,6 +113,16 @@ array proportional to the number of windows. The original chronological split
 membership remains fixed. Native checkpoints under `OUTPUT/checkpoints` save
 model, optimizer, scheduler, RNG and consumed-sample counters.
 
+For a complete pass over the training bars, replace `--steps` with `--epochs 1`.
+Epoch mode uses a stride equal to the context length, so each predictable bar
+is a target once per epoch. It retains short and final windows using a per-bar
+loss mask. Each segment needs its initial anchor and first input observation;
+remaining bars are targets. The last global batch is completed with masked
+dummy samples rather than repeated real samples. Gradient normalization uses
+the global count of valid target bars across ranks and accumulated microbatches.
+Validation and test dates retain their original split membership. `--steps`
+continues to select the overlapping-window experiment described above.
+
 For an interrupted run, repeat the training command with the same output and
 settings and add `--resume runs/ashare-ohlcv/checkpoints`. `--steps` is the
 original total training horizon. The recorded run configuration and prepared

@@ -9,6 +9,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -58,10 +59,26 @@ def train(args: argparse.Namespace) -> None:
     # Forecasting starts from scratch and discards the language embedding/head.
     hf.vocab_size = 1
     hf.tie_word_embeddings = False
+    # Count actual windows before resolving an epoch-based optimizer-step budget.
+    for split in ("train", "validation", "test") if args.eval_iters else ("train",):
+        dataset = OHLCVWindowDataset(
+            args.data,
+            split=split,
+            seq_length=args.context,
+            stride=args.context if args.epochs is not None else 1,
+            keep_tail=args.epochs is not None,
+        )
+        logger.info("%s: %d available windows", split, dataset.num_windows)
+        if split == "train" and args.epochs is not None:
+            args.steps = math.ceil(dataset.num_windows * args.epochs / args.global_batch_size)
+            logger.info("%d epoch(s) resolve to %d optimizer steps", args.epochs, args.steps)
+    if args.warmup_steps >= args.steps:
+        raise ValueError("warmup_steps must be less than the resolved training steps.")
     run: ForecastRun = {
         "hf_config": json.loads(hf.to_json_string()),
         "manifest_sha256": manifest_digest(args.data),
         "steps": args.steps,
+        "epochs": args.epochs,
         "global_batch_size": args.global_batch_size,
         "micro_batch_size": args.micro_batch_size,
         "learning_rate": args.learning_rate,
@@ -74,10 +91,6 @@ def train(args: argparse.Namespace) -> None:
     }
     if args.resume and not checkpoint_exists(str(args.resume)):
         raise FileNotFoundError(f"No native training checkpoint found in {args.resume}.")
-    # Fail before distributed setup if the selected context leaves no windows.
-    for split in ("train", "validation", "test") if args.eval_iters else ("train",):
-        dataset = OHLCVWindowDataset(args.data, split=split, seq_length=args.context)
-        logger.info("%s: %d available windows", split, dataset.num_windows)
     if int(os.environ.get("RANK", "0")) == 0:
         if args.resume:
             if args.resume.resolve() != (args.output / "checkpoints").resolve():
@@ -100,6 +113,7 @@ def train(args: argparse.Namespace) -> None:
         eval_interval=args.eval_interval,
         eval_iters=args.eval_iters,
         seed=args.seed,
+        epochs=args.epochs,
     )
     cfg.checkpoint.load = str(args.resume) if args.resume else None
     cfg.train.exit_interval = args.exit_interval
@@ -253,7 +267,11 @@ def main() -> None:
     training.add_argument("--data", type=Path, required=True)
     training.add_argument("--output", type=Path, required=True)
     training.add_argument("--context", type=int, default=64)
-    training.add_argument("--steps", type=int, default=10000)
+    budget = training.add_mutually_exclusive_group()
+    budget.add_argument("--steps", type=int, help="Optimizer steps; defaults to 10000 without --epochs")
+    budget.add_argument(
+        "--epochs", type=int, help="Complete passes with nonoverlapping targets, retaining tail windows"
+    )
     training.add_argument("--global-batch-size", type=int, default=32)
     training.add_argument("--micro-batch-size", type=int, default=4)
     training.add_argument("--learning-rate", type=float, default=3e-4)
@@ -281,12 +299,13 @@ def main() -> None:
     evaluation.set_defaults(handler=evaluate)
     args = parser.parse_args()
     if args.command == "train":
+        if args.steps is None and args.epochs is None:
+            args.steps = 10000
         if (
             any(
                 value <= 0
                 for value in (
                     args.context,
-                    args.steps,
                     args.global_batch_size,
                     args.micro_batch_size,
                     args.learning_rate,
@@ -295,7 +314,9 @@ def main() -> None:
                 )
             )
             or args.eval_iters < 0
-            or not 0 <= args.warmup_steps < args.steps
+            or args.warmup_steps < 0
+            or (args.steps is not None and (args.steps <= 0 or args.warmup_steps >= args.steps))
+            or (args.epochs is not None and args.epochs <= 0)
         ):
             parser.error("Positive training settings and 0 <= warmup_steps < steps are required.")
         world = int(os.environ.get("WORLD_SIZE", "1"))

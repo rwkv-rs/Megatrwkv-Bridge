@@ -171,6 +171,29 @@ def test_parallel_preparation_matches_serial(prepared):
         )
 
 
+def test_epoch_covers_each_target_once_and_masks_tail_and_final_batch(prepared):
+    _, output = prepared
+    dataset = OHLCVWindowDataset(
+        output, split="train", seq_length=3, stride=3, keep_tail=True, epochs=1, target_length=4
+    )
+    assert dataset.num_windows == 3 and len(dataset) == 4
+    labels = []
+    valid_counts = []
+    for index in range(4):
+        item = dataset[index]
+        valid = item["loss_mask"].astype(bool)
+        labels.extend(item["labels"][valid])
+        valid_counts.append(int(valid.sum()))
+    assert valid_counts == [3, 3, 1, 0]
+    features = np.load(output / "SZ/000001/features.npy")
+    np.testing.assert_array_equal(np.array(labels), features[1:8])
+    assert not dataset[3]["features"].any()
+    resumed = OHLCVWindowDataset(
+        output, split="train", seq_length=3, stride=3, keep_tail=True, epochs=1, target_length=4, seed=2026
+    )
+    assert sum(resumed[index]["loss_mask"].sum() for index in range(4)) == 7
+
+
 def test_reject_unsorted_or_mixed_instrument_parquet(tmp_path):
     file = tmp_path / "bad.parquet"
     values = {name: [10, 10] for name in OHLCV_COLUMNS}

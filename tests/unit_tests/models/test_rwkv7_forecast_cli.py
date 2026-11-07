@@ -22,6 +22,7 @@ def test_help_without_training_dependencies(monkeypatch, command):
     "arguments",
     [
         ["--steps", "0"],
+        ["--epochs", "0"],
         ["--warmup-steps", "10000"],
         ["--global-batch-size", "7"],
         ["--context", "0"],

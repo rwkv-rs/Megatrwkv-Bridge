@@ -288,10 +288,17 @@ class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):
         stride: int = 1,
         target_length: int | None = None,
         seed: int | None = None,
+        keep_tail: bool = False,
+        epochs: int | None = None,
     ) -> None:
         if seq_length <= 0 or horizon <= 0 or stride <= 0:
             raise ValueError("seq_length, horizon and stride must be positive.")
         self.root, self.seq_length, self.horizon, self.stride = Path(root), seq_length, horizon, stride
+        if keep_tail and (stride != seq_length or horizon != 1):
+            raise ValueError("Tail windows require stride=seq_length and horizon=1.")
+        if epochs is not None and epochs <= 0:
+            raise ValueError("epochs must be positive.")
+        self.keep_tail, self.epochs = keep_tail, epochs
         manifest: OHLCVManifest = json.loads((self.root / "manifest.json").read_text())
         if (
             manifest["version"] != 1
@@ -332,7 +339,10 @@ class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):
         self._segment_counts = np.empty(0, dtype=np.int64)
 
     def _window_counts(self, segments: NDArray[np.int64]) -> NDArray[np.int64]:
-        counts = np.maximum(0, (segments[:, 1] - self.seq_length - self.horizon) // self.stride + 1)
+        if self.keep_tail:
+            counts = (segments[:, 1] - 1 + self.seq_length - 1) // self.seq_length
+        else:
+            counts = np.maximum(0, (segments[:, 1] - self.seq_length - self.horizon) // self.stride + 1)
         return np.where(segments[:, 2] == self.split_index, counts, 0)
 
     def __len__(self) -> int:
@@ -366,9 +376,22 @@ class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):
 
     def __getitem__(self, index: int) -> dict[str, NDArray[np.float32]]:
         """Return aligned teacher-forcing inputs and next-bar labels."""
-        _, start, arrays = self.window(index)
-        values = arrays["features"][start : start + self.seq_length + 1]
-        return {"features": values[:-1].copy(), "labels": values[1:].copy()}
+        sample = {
+            "features": np.zeros((self.seq_length, 5), dtype=np.float32),
+            "labels": np.zeros((self.seq_length, 5), dtype=np.float32),
+            "loss_mask": np.zeros(self.seq_length, dtype=np.float32),
+        }
+        # Complete the final native global batch without repeating real labels.
+        if self.epochs is not None and index >= self.num_windows * self.epochs:
+            return sample
+        segment, start, arrays = self.window(index)
+        end = min(start + self.seq_length + 1, segment["offset"] + segment["length"])
+        values = arrays["features"][start:end]
+        valid = len(values) - 1
+        sample["features"][:valid] = values[:-1]
+        sample["labels"][:valid] = values[1:]
+        sample["loss_mask"][:valid] = 1
+        return sample
 
 
 def manifest_digest(root: Path) -> str:
