@@ -1,0 +1,11 @@
+{
+  "model_type": "rwkv",
+  "architectures": ["RwkvForCausalLM"],
+  "architecture_version": "rwkv7",
+  "hidden_size": 128,
+  "num_hidden_layers": 2,
+  "vocab_size": 256,
+  "context_length": 64,
+  "head_size": 64,
+  "tie_word_embeddings": false
+}
