@@ -180,6 +180,8 @@ separately by the dataset author.
 Add `--diagnostics-interval 10` to native training to record global, layer and
 module statistics under `forecast/` in TensorBoard and in `diagnostics.jsonl`.
 The callback observes native AdamW without changing gradients or optimizer steps.
+The sensitive TimeMix `k_a`, `k_k` and `w0` parameters also have individual groups,
+so their parameter and gradient scales are not hidden by module-wide aggregates.
 It records parameter and gradient L2 norms, RMS and absolute maxima; raw gradients
 are reconstructed from the native clipping coefficient. Both the pre-clipping
 gradient norm and the post-clipping norm are retained. FP32 master-weight

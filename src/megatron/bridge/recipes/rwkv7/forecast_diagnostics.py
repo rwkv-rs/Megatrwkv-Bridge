@@ -38,8 +38,13 @@ def adamw_update_direction(
     return (first_moment / correction1) / ((second_moment / correction2).sqrt() + eps)
 
 
-def _module_name(name: str) -> str:
-    return name.rsplit(".", 1)[0]
+def _statistic_groups(name: str) -> list[str]:
+    groups = ["global", name.rsplit(".", 1)[0]]
+    if name.startswith("hf.layers."):
+        groups.append(".".join(name.split(".")[:3]))
+        if name.endswith((".k_a", ".k_k", ".w0")):
+            groups.append(name)
+    return groups
 
 
 class ForecastDiagnosticsCallback(Callback):
@@ -74,9 +79,7 @@ class ForecastDiagnosticsCallback(Callback):
         owners = {id(p): opt.optimizer for opt in optimizers for group in opt.param_groups for p in group["params"]}
         names = set()
         for name, parameter in model.named_parameters():
-            names.update(("global", _module_name(name)))
-            if name.startswith("hf.layers."):
-                names.add(".".join(name.split(".")[:3]))
+            names.update(_statistic_groups(name))
             master = parameter.main_param
             if master is not None:
                 self.parameters.append((name, master, groups[id(master)]))
@@ -155,10 +158,7 @@ class ForecastDiagnosticsCallback(Callback):
                 )
             ).double()
             peaks = torch.stack((p.abs().max(), raw_grad.abs().max(), delta.abs().max(), update.abs().max()))
-            keys = ["global", _module_name(name)]
-            if name.startswith("hf.layers."):
-                keys.append(".".join(name.split(".")[:3]))
-            for key in keys:
+            for key in _statistic_groups(name):
                 row = index[key]
                 sums[row] += values
                 maxima[row] = torch.maximum(maxima[row], peaks)
