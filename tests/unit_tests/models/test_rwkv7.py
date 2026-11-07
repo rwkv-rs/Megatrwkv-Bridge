@@ -3,8 +3,6 @@
 
 """RWKV-7 construction, loss alignment, conversion and LoRA contracts."""
 
-import csv
-import json
 import runpy
 import sys
 from pathlib import Path
@@ -207,46 +205,43 @@ def test_training_entry_checkpoint_and_precision(hf_config, tmp_path, monkeypatc
         assert cfg.ddp.overlap_grad_reduce
 
 
-_PERFORMANCE = Path(__file__).resolve().parents[3] / "examples/models/rwkv7/performance-a18.csv"
-
-
-@pytest.mark.parametrize("case", list(csv.DictReader(_PERFORMANCE.open())))
-def test_pro6000_recipe_matches_measured_configuration(case):
+@pytest.mark.parametrize("context", [4096, 16384, 65536])
+@pytest.mark.parametrize(
+    ("layers", "hidden", "peft", "layouts"),
+    [
+        (24, 2048, False, [(2, "none", 0), (1, "tmix", 0), (1, "infctx", 4096)]),
+        (32, 2560, False, [(1, "none", 0), (1, "layers", 0), (1, "infctx", 2048)]),
+        (32, 4096, False, [(1, "layers", 0), (1, "layers", 0), (1, "infctx", 1024)]),
+        (61, 4096, False, [(1, "layers", 0), (1, "layers", 0), (1, "infctx", 1024)]),
+        (24, 2048, True, [(4, "none", 0), (1, "none", 0), (4, "infctx", 4096)]),
+        (32, 2560, True, [(2, "none", 0), (2, "tmix", 0), (2, "infctx", 4096)]),
+        (32, 4096, True, [(1, "none", 0), (1, "tmix", 0), (3, "infctx", 2048)]),
+        (61, 4096, True, [(2, "tmix", 0), (3, "layers", 0), (2, "infctx", 1024)]),
+    ],
+)
+def test_pro6000_recipe_defaults(layers, hidden, peft, layouts, context):
     from megatron.bridge.recipes.rwkv7 import rwkv7_8gpu_pro6000_config
 
-    layers, hidden = {
-        "rwkv-g1l-1b-temp-6331": (24, 2048),
-        "rwkv-g1l-3b-temp-5764": (32, 2560),
-        "rwkv-g1l-7b-temp-3797": (32, 4096),
-        "rwkv-g1l-13b-temp-5497": (61, 4096),
-    }[case["model"]]
     config = RwkvConfig(
         hidden_size=hidden,
         num_hidden_layers=layers,
         vocab_size=65536,
-        context_length=int(case["sequence_length"]),
+        context_length=context,
     )
-    adapter = (
-        None
-        if case["mode"] == "full"
-        else RWKV7LoRA(
-            dim=int(case["rank"]),
-            alpha=int(case["alpha"]),
-            use_nora=case["mode"] == "nora",
-        )
-    )
+    adapter = RWKV7LoRA(dim=32, alpha=32, use_nora=True) if peft else None
     cfg = rwkv7_8gpu_pro6000_config(config, pretrained_checkpoint="checkpoint", peft=adapter)
+    microbatch, strategy, chunk = layouts[(4096, 16384, 65536).index(context)]
     assert cfg.peft is adapter
     assert not cfg.model.perform_initialization
     assert cfg.checkpoint.pretrained_checkpoint == "checkpoint"
-    for field in ("micro_batch_size", "global_batch_size"):
-        assert getattr(cfg.train, field) == int(case[field])
-    for field in ("head_chunk_size", "infctx_chunk_size"):
-        assert getattr(cfg.model, field) == int(case[field])
-    for field in ("checkpoint_infctx", "checkpoint_layers", "checkpoint_tmix", "detach_infctx_state"):
-        assert getattr(cfg.model, field) == (case[field] == "True")
-    assert cfg.dist.use_megatron_fsdp == (case["use_megatron_fsdp"] == "True")
-    assert cfg.optimizer.use_distributed_optimizer == (case["distributed_optimizer"] == "True")
+    assert cfg.train.micro_batch_size == microbatch and cfg.train.global_batch_size == 8 * microbatch
+    assert cfg.model.head_chunk_size == 1024 and cfg.model.infctx_chunk_size == chunk
+    assert cfg.model.checkpoint_infctx == (strategy == "infctx")
+    assert cfg.model.checkpoint_tmix == (strategy == "tmix")
+    assert cfg.model.checkpoint_layers == (strategy == "layers" or (not peft and layers == 61 and context == 65536))
+    assert not cfg.model.detach_infctx_state
+    assert cfg.dist.use_megatron_fsdp == (not peft and layers == 61)
+    assert cfg.optimizer.use_distributed_optimizer == (not peft)
 
 
 def test_training_entry_explicit_overrides(tmp_path, monkeypatch):
@@ -287,66 +282,3 @@ def test_training_entry_explicit_overrides(tmp_path, monkeypatch):
     assert (cfg.train.micro_batch_size, cfg.train.global_batch_size) == (2, 32)
     assert cfg.model.head_chunk_size == 512 and cfg.model.infctx_chunk_size == 0
     assert not cfg.model.checkpoint_infctx and not cfg.model.checkpoint_layers
-
-
-@pytest.mark.parametrize("mode", ["full", "nora"])
-@pytest.mark.parametrize("strategy", ["default", "infctx"])
-def test_benchmark_uses_training_recipe(tmp_path, monkeypatch, mode, strategy):
-    directory = Path(__file__).resolve().parents[3] / "examples/models/rwkv7"
-    config = tmp_path / "config.json"
-    RwkvConfig(hidden_size=4096, num_hidden_layers=61, vocab_size=65536).to_json_file(config)
-    manifest = tmp_path / "models.json"
-    manifest.write_text(json.dumps([{"name": "13b", "config": str(config), "checkpoint": "checkpoint"}]))
-    monkeypatch.syspath_prepend(str(directory))
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            str(directory / "benchmark.py"),
-            "--models",
-            str(manifest),
-            "--output",
-            str(tmp_path / "run"),
-            "--modes",
-            mode,
-            "--seq-lengths",
-            "65536",
-            "--strategies",
-            strategy,
-        ],
-    )
-
-    def run_training(command, **kwargs):
-        start = command.index("examples/models/rwkv7/train.py")
-        with patch.object(sys, "argv", command[start:]):
-            runpy.run_path(str(directory / "train.py"), run_name="__main__")
-        output = Path(command[command.index("--output") + 1])
-        (output / "summary.json").write_text(
-            json.dumps(
-                {
-                    "finite_losses": True,
-                    "finite_grad_norms": True,
-                    "skipped_rank_steps": 0,
-                }
-            )
-        )
-        return Mock(returncode=0)
-
-    with (
-        patch("subprocess.run", side_effect=run_training) as launch,
-        patch("megatron.bridge.training.finetune.finetune") as finetune,
-    ):
-        runpy.run_path(str(directory / "benchmark.py"), run_name="__main__")
-    cfg = finetune.call_args.args[0]
-    command = launch.call_args.args[0]
-    if strategy == "default":
-        assert "--profile" not in command and "--micro-batch-size" not in command
-        assert cfg.model.checkpoint_layers == (mode == "full")
-        assert cfg.train.micro_batch_size == (1 if mode == "full" else 2)
-        assert cfg.dist.use_megatron_fsdp == (mode == "full")
-    else:
-        assert command[command.index("--profile") + 1] == "generic"
-        assert not cfg.model.checkpoint_layers and not cfg.dist.use_megatron_fsdp
-        assert cfg.train.micro_batch_size == 1
-    assert cfg.model.infctx_chunk_size == 1024 and cfg.model.checkpoint_infctx
-    assert cfg.model.head_chunk_size == 1024

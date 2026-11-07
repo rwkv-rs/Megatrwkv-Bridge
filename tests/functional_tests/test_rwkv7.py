@@ -8,6 +8,9 @@ import torch
 import torch.nn.functional as F
 from transformers import RwkvConfig, RwkvForCausalLM
 
+
+pytest.importorskip("transformers.integrations.flash_rwkv2", reason="Requires transformers-rwkv RWKV-7")
+
 from megatron.bridge.models.rwkv7 import RWKV7Bridge, RWKV7Model
 from megatron.bridge.peft.rwkv7 import RWKV7LoRA
 

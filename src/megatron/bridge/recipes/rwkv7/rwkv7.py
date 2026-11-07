@@ -70,7 +70,7 @@ def rwkv7_8gpu_pro6000_config(
 ) -> ConfigContainer:
     """Build the measured RTX PRO 6000 Blackwell eight-GPU token training recipe.
 
-    Supports the four g1l architectures identified in the RWKV7 example manifest,
+    Supports the four g1l architectures documented in the RWKV7 example,
     at 4096, 16384 and 65536 tokens. LoRA/NoRA ranks 8, 16 and 32 share the PEFT
     layout. Global batch is eight times microbatch; configure data, learning-rate
     schedule and training budget for the intended convergence experiment.

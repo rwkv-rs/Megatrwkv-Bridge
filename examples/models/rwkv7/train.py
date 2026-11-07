@@ -7,7 +7,6 @@ import argparse
 from pathlib import Path
 
 import torch
-from performance import RWKV7PerformanceCallback
 from transformers import RwkvConfig
 
 from megatron.bridge import AutoBridge
@@ -80,13 +79,9 @@ def main() -> None:
     parser.add_argument("--checkpoint-infctx", action=argparse.BooleanOptionalAction)
     parser.add_argument("--checkpoint-layers", action=argparse.BooleanOptionalAction)
     parser.add_argument("--checkpoint-tmix", action=argparse.BooleanOptionalAction)
-    parser.add_argument("--benchmark", action="store_true")
-    parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--overlap-grad-reduce", action=argparse.BooleanOptionalAction)
     parser.add_argument("--distributed-optimizer", action=argparse.BooleanOptionalAction)
     args = parser.parse_args()
-    if args.benchmark and args.steps <= args.warmup:
-        parser.error("--steps must exceed --warmup")
     if args.nora and not args.base:
         parser.error("--nora requires --base")
     if args.full_parameter and args.nora:
@@ -174,10 +169,6 @@ def main() -> None:
         cfg.ddp.use_distributed_optimizer = args.distributed_optimizer
         cfg.optimizer.use_distributed_optimizer = args.distributed_optimizer
     callbacks = []
-    if args.benchmark:
-        cfg.checkpoint.save = None
-        cfg.logger.log_interval = 1
-        callbacks = [RWKV7PerformanceCallback(output, warmup=args.warmup)]
     if args.export_hf:
         source = Path(args.config).parent
         callbacks.append(
