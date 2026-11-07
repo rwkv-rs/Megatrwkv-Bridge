@@ -175,6 +175,52 @@ evaluator to assess accumulated rollout error. The prepared manifest must match
 the training run. Source data covers A-share equities; ETF data is published
 separately by the dataset author.
 
+## Stability diagnostics
+
+Add `--diagnostics-interval 10` to native training to record global, layer and
+module statistics under `forecast/` in TensorBoard and in `diagnostics.jsonl`.
+The callback observes native AdamW without changing gradients or optimizer steps.
+It records parameter and gradient L2 norms, RMS and absolute maxima; raw gradients
+are reconstructed from the native clipping coefficient. Both the pre-clipping
+gradient norm and the post-clipping norm are retained. FP32 master-weight
+snapshots provide actual parameter changes (`delta_*`) and relative updates.
+`update_*` describes the AdamW direction recovered from those changes after
+removing the applied learning rate and decoupled weight decay. This recovery
+includes FP32 master-weight rounding, rather than BF16 model-copy rounding.
+DP optimizer shards are counted once, and absolute maxima use MAX reductions.
+
+Forward hooks record hidden RMS and absmax at each block, TimeMix and ChannelMix
+output, including padded tail positions. These are reduced across DP ranks.
+RWKV does not produce softmax attention logits or attention entropy. The native
+loss logger additionally reports all five OHLCV channel losses with the same
+valid-position mask and denominator as the overall loss.
+
+The callback logs periodic samples plus events whose raw gradient norm exceeds
+five times the preceding 100-step median or whose loss exceeds 1.2 times that
+median. These event rules trigger recording, not clipping or skipped updates.
+The parameter RMS mean-field reference follows the dynamic approximation in
+[AdamW Weight RMS, part 2](https://kexue.fm/archives/11404):
+`q_t = (1 - lr_t * wd_t)^2 * q_(t-1) + lr_t^2`, initialized from actual parameter
+mean squares. It is an approximate reference under the article's assumptions,
+not a target for every RWKV parameter. Decay-free parameters have no finite
+constant-LR stationary RMS.
+
+For a separately validated initialization experiment, add
+`--calibration-windows 4096 --head-gain 0.01 --head-fp32`. Calibration uses only
+training windows, initializes the input projection and its constant direction
+jointly and orthogonally in FP32 before BF16 rounding, and gives the output head
+a small orthogonal gain. The nonzero constant direction keeps unchanged,
+zero-volume bars away from a zero-variance embedding. The output biases
+encode the training target means, including inverse softplus for positive
+channels. `--head-fp32` computes the final projection in FP32 while retaining
+BF16 parameter storage and the existing RWKV backbone precision. These choices
+are persisted in the HF configuration in `run.json` and exported checkpoints.
+
+Training validation now repeats a fixed, seeded selection of holdout windows
+at every evaluation. This separates model changes from changes in evaluation
+stocks and times. Evaluation still covers a subset; free-running metrics use
+the separate evaluator above.
+
 ## Validation commands
 
 ```bash

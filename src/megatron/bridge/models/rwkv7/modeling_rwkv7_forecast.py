@@ -47,14 +47,19 @@ class RWKV7ForecastModel(RWKV7Model):
         if getattr(self.hf.config, "forecast_initialization", "linear") == "calibrated":
             # Initialize in FP32 before rounding, as in RWKV-LM's generated weights.
             with torch.no_grad():
-                weight = torch.empty_like(self.input_projection.weight, dtype=torch.float32)
-                nn.init.orthogonal_(weight, gain=(model_config.hidden_size / 5) ** 0.5)
-                self.input_projection.weight.copy_(weight)
-                self.input_projection.bias.zero_()
+                # A separate constant direction keeps zero-volume, unchanged
+                # bars away from the zero-variance input of embedding LayerNorm.
+                weight = torch.empty(
+                    model_config.hidden_size, 6, device=self.input_projection.weight.device, dtype=torch.float32
+                )
+                nn.init.orthogonal_(weight, gain=(model_config.hidden_size / 6) ** 0.5)
+                self.input_projection.weight.copy_(weight[:, :5])
+                self.input_projection.bias.copy_(weight[:, 5])
                 weight = torch.empty_like(self.output_projection.weight, dtype=torch.float32)
                 nn.init.orthogonal_(weight, gain=self.hf.config.forecast_head_gain)
                 self.output_projection.weight.copy_(weight)
                 bias = torch.tensor(self.hf.config.forecast_target_mean, dtype=torch.float32)
+                bias[2:].clamp_(min=torch.finfo(torch.float32).eps)
                 bias[2:] = bias[2:] + torch.log(-torch.expm1(-bias[2:]))
                 self.output_projection.bias.copy_(bias)
 

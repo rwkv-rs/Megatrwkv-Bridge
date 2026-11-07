@@ -108,9 +108,9 @@ def rwkv7_ohlcv_config(
     seed: int,
     epochs: int | None = None,
 ) -> ConfigContainer:
-    """Build an early, unoptimized continuous RWKV7 training experiment.
+    """Build continuous RWKV7 training with fixed, distributed holdout windows.
 
-    Throughput has not been measured. Uses teacher forcing with FP32 Huber
+    Uses teacher forcing with FP32 Huber
     loss over five encoded channels, BF16 computation and FP32 WKV state.
     Native DDP/checkpoint/optimizer/scheduler/data-progress handling is reused.
     """

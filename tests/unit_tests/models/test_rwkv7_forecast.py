@@ -118,7 +118,7 @@ def test_calibrated_head_has_training_prior_and_fp32_output(config):
     with patch.object(model.hf, "forward", return_value=SimpleNamespace(last_hidden_state=hidden)):
         prediction = model(torch.zeros(2, 8, 5))
     torch.testing.assert_close(prediction[0, 0], torch.tensor([0.0, 0.0, 0.03, 0.04, 0.85]), atol=0.003, rtol=0.01)
-    assert torch.count_nonzero(model.input_projection.bias) == 0
+    assert model.input_projection.bias.norm() > 0
     assert prediction.dtype == torch.float32
 
 
