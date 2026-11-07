@@ -231,6 +231,7 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl import (
     Qwen3VLMoEBridge,
     Qwen3VLMoEModelProvider,
 )
+from megatron.bridge.models.rwkv7 import RWKV7Bridge, RWKV7Model, RWKV7ModelBuilder, RWKV7ModelConfig
 from megatron.bridge.models.sarvam import (
     SarvamMLABridge,
     SarvamMoEBridge,
@@ -392,4 +393,8 @@ __all__ = [
     "Exaone45ModelProvider",
     "ExaoneMoeBridge",
     "ExaoneMoeModelProvider",
+    "RWKV7Bridge",
+    "RWKV7Model",
+    "RWKV7ModelBuilder",
+    "RWKV7ModelConfig",
 ] + _BAGEL_EXPORTS
