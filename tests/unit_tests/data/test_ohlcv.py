@@ -309,3 +309,17 @@ def test_stratified_window_selection_uses_all_stride_one_origins(prepared, tmp_p
     assert {r["index"] for r in frozen} == {0, 1}
     assert all(r["window_stride"] == 1 for r in frozen)
     assert len({r["context_end"] for r in frozen}) == 2
+
+
+def test_direct_quantile_training_defers_test_split_until_model_selection(prepared):
+    from types import SimpleNamespace
+
+    from megatron.bridge.recipes.rwkv7.forecast import OHLCVDatasetConfig
+
+    _, root = prepared
+    config = OHLCVDatasetConfig(
+        root=str(root), seq_length=3, seed=1234, forecast_task="direct_quantile", forecast_horizon=4
+    )
+    train, validation, test = config.build_datasets(SimpleNamespace(train_samples=2, valid_samples=2, test_samples=2))
+    assert train is not None and validation is not None
+    assert test is None

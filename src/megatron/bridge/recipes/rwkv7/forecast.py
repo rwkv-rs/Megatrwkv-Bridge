@@ -118,6 +118,10 @@ class OHLCVDatasetConfig(DatasetProvider):
             ("train", "validation", "test"),
             (context.train_samples, context.valid_samples, context.test_samples),
         ):
+            if split == "test" and self.forecast_task == "direct_quantile":
+                # Test evaluation is explicit, after validation-based model selection.
+                datasets.append(None)
+                continue
             datasets.append(
                 dataset_class(
                     Path(self.root),

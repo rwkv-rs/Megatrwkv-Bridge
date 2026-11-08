@@ -507,6 +507,10 @@ feature/validation identity hashes. Calibration uses training windows only.
 labels for fixed ridge (alpha=1) and volatility-quartile/session empirical
 references. Neither reference uses test labels for fitting or selection.
 
+Use `evaluate --split train` for fixed training-period diagnostics.
+Direct-quantile training omits the native test loader; run explicit test evaluation
+after validation-based checkpoint selection.
+
 The callback saves `best-forecast.pt` for raw pinball and
 `best-median-forecast.pt` for raw median cumulative-return MAE. Compare these
 candidates on the frozen validation set before opening independent test labels;

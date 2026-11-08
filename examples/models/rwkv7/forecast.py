@@ -509,7 +509,7 @@ def main() -> None:
     evaluation.add_argument("--checkpoint", type=Path, required=True)
     evaluation.add_argument("--data", type=Path, required=True)
     evaluation.add_argument("--output", type=Path, required=True)
-    evaluation.add_argument("--split", choices=("validation", "test"), default="test")
+    evaluation.add_argument("--split", choices=("train", "validation", "test"), default="test")
     evaluation.add_argument("--horizon", type=int, required=True)
     evaluation.add_argument("--max-windows", type=int, default=1000)
     evaluation.add_argument("--windows", type=Path, help="Frozen window identities from an earlier evaluation")
