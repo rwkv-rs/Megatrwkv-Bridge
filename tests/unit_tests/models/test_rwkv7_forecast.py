@@ -353,6 +353,8 @@ def test_checkpoint_fork_preserves_source_and_resumes_corrected_groups(tmp_path,
     RwkvConfig(hidden_size=64, num_hidden_layers=2, context_length=16).to_json_file(architecture)
     args = SimpleNamespace(
         config=architecture,
+        covariates=None,
+        validation_indices=None,
         data=tmp_path / "data",
         output=tmp_path / "source",
         context=16,
@@ -409,10 +411,12 @@ def test_checkpoint_fork_preserves_source_and_resumes_corrected_groups(tmp_path,
         assert captured[-1].optimizer_config_override_provider.apply_lr_bounds is True
 
 
-def test_direct_quantile_head_loss_gradients_and_rearrangement(config):
+@pytest.mark.parametrize("input_size", [5, 23])
+def test_direct_quantile_head_loss_gradients_and_rearrangement(config, input_size):
     config.hf_config.update(forecast_task="direct_quantile", forecast_horizon=3, forecast_quantiles=[0.1, 0.5, 0.9])
+    config.hf_config["forecast_input_size"] = input_size
     model = RWKV7ForecastModel(config, None)
-    features = torch.randn(2, 8, 5)
+    features = torch.randn(2, 8, input_size)
     labels = torch.tensor([[0.1, 0.2, 0.3], [-0.1, -0.2, -0.3]])
     with patch.object(
         model.hf, "forward", side_effect=lambda **kw: SimpleNamespace(last_hidden_state=kw["inputs_embeds"])
@@ -471,6 +475,9 @@ def test_quantile_evaluation_proper_scores_and_price_units():
     target = np.zeros((2, 3))
     prediction = np.broadcast_to(np.array([-1.0, 0.0, 1.0]), (2, 3, 3))
     scores = api["quantile_metrics"](target, prediction, np.array([0.1, 0.5, 0.9]))
+    assert scores["discrete_calibration_violation_by_quantile"][1] == 0
+    assert scores["cdf_strict_by_horizon_quantile"][0][1] == 0
+    assert scores["cdf_weak_by_horizon_quantile"][0][1] == 1
     assert scores["pinball_bps"] == pytest.approx(100 / 15)
     assert scores["interval_80"]["coverage"] == 1
     assert scores["interval_80"]["width_bps"] == 200

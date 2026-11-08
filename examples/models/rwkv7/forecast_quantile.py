@@ -35,6 +35,12 @@ def quantile_metrics(target: NDArray[Any], prediction: NDArray[Any], levels: NDA
         "pinball_bps": float(pinball.mean()),
         "pinball_bps_by_horizon": pinball.mean((0, 2)).tolist(),
         "pinball_bps_by_quantile": pinball.mean((0, 1)).tolist(),
+        "cdf_strict_by_horizon_quantile": (target[..., None] < prediction).mean(0).tolist(),
+        "cdf_weak_by_horizon_quantile": (target[..., None] <= prediction).mean(0).tolist(),
+        "discrete_calibration_violation_by_quantile": (
+            np.maximum((target[..., None] < prediction).mean((0, 1)) - levels, 0)
+            + np.maximum(levels - (target[..., None] <= prediction).mean((0, 1)), 0)
+        ).tolist(),
         "calibration_by_horizon_quantile": (target[..., None] <= prediction).mean(0).tolist(),
         "calibration_error_by_quantile": ((target[..., None] <= prediction).mean((0, 1)) - levels).tolist(),
     }
@@ -60,7 +66,19 @@ def point_metrics(actual: NDArray[Any], predicted: NDArray[Any], anchors: NDArra
     error = predicted - actual
     relative = error / anchors[:, None] * 100
     returns = np.log(predicted / actual) * 10000
+    actual_returns = np.log(actual / anchors[:, None]) * 10000
+    predicted_returns = np.log(predicted / anchors[:, None]) * 10000
+    actual_centered = actual_returns - actual_returns.mean(0)
+    predicted_centered = predicted_returns - predicted_returns.mean(0)
+    denominator = np.sqrt((actual_centered**2).sum(0) * (predicted_centered**2).sum(0))
+    correlations = [
+        float((actual_centered[:, h] * predicted_centered[:, h]).sum() / value) if value > 0 else None
+        for h, value in enumerate(denominator)
+    ]
     return {
+        "return_correlation_by_horizon": correlations,
+        "predicted_return_mean_bps_by_horizon": predicted_returns.mean(0).tolist(),
+        "actual_return_mean_bps_by_horizon": actual_returns.mean(0).tolist(),
         "mae_cny_by_horizon": np.abs(error).mean(0).tolist(),
         "rmse_cny_by_horizon": np.sqrt(np.square(error).mean(0)).tolist(),
         "bias_cny_by_horizon": error.mean(0).tolist(),
@@ -81,17 +99,27 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
     if args.horizon != model.horizon:
         raise ValueError("Evaluation horizon must equal the trained forecast horizon.")
     context, horizon = payload["run"]["hf_config"]["context_length"], model.horizon
+    windows = json.loads(args.windows.read_text()) if args.windows else []
+    stride = int(windows[0].get("window_stride", horizon)) if windows else 1
+    covariates = getattr(args, "covariates", None)
+    expected_digest = payload["run"].get("covariates_sha256")
+    if expected_digest:
+        if covariates is None:
+            covariates = Path(payload["run"]["covariates"])
+        with (covariates / "manifest.json").open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != expected_digest:
+                raise ValueError("Covariate identity differs from the checkpoint.")
+    elif covariates is not None:
+        raise ValueError("This checkpoint does not use covariates.")
     dataset = OHLCVQuantileWindowDataset(
-        args.data, split=args.split, seq_length=context, horizon=horizon, stride=horizon
+        args.data, split=args.split, seq_length=context, horizon=horizon, stride=stride, covariates=covariates
     )
-    if args.windows:
-        windows = json.loads(args.windows.read_text())
-    else:
+    if not args.windows:
         indices = np.linspace(0, len(dataset) - 1, min(args.max_windows, len(dataset)), dtype=np.int64)
-        windows = [{"index": int(i)} for i in indices]
+        windows = [{"index": int(i), "window_stride": stride} for i in indices]
     # Freeze illustrative examples before predicting any test outcome.
     fixed = np.random.default_rng(payload["run"]["seed"]).choice(len(windows), min(8, len(windows)), replace=False)
-    raw, anchors, actual, histories, times, identities = [], [], [], [], [], []
+    inputs_list, anchors, actual, histories, times, identities = [], [], [], [], [], []
     for row in windows:
         info, start, arrays = dataset.window(row["index"])
         end = start + context
@@ -103,8 +131,10 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
         future_times = [str(t) for t in arrays["timestamps"][end : end + horizon]]
         if args.windows and (any(row[k] != v for k, v in identity.items()) or row["timestamps"] != future_times):
             raise ValueError("Frozen evaluation window no longer matches dataset identity and timestamps.")
-        inputs = torch.from_numpy(np.array(arrays["features"][start:end])).unsqueeze(0).cuda()
-        raw.append(model.predict_quantiles(inputs, fix_quantile_crossing=False)[0].cpu().numpy())
+        if not args.windows:
+            row.update(identity)
+            row["timestamps"] = future_times
+        inputs_list.append(np.array(arrays["features"][start:end]))
         anchors.append(float(arrays["close"][end - 1]))
         actual.append(np.array(arrays["close"][end : end + horizon]))
         histories.append(np.array(arrays["close"][start:end]))
@@ -112,7 +142,12 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
         identities.append(identity)
     anchor = np.asarray(anchors)
     truth = np.asarray(actual)
-    raw_array = np.asarray(raw, dtype=np.float64)
+    all_inputs = np.asarray(inputs_list)
+    raw = []
+    for begin in range(0, len(all_inputs), 256):
+        inputs = torch.from_numpy(all_inputs[begin : begin + 256]).cuda()
+        raw.append(model.predict_quantiles(inputs, fix_quantile_crossing=False).cpu().numpy())
+    raw_array = np.concatenate(raw).astype(np.float64)
     ordered = np.sort(raw_array, axis=-1)
     levels = np.asarray(model.quantile_levels)
     target = 100 * np.log(truth / anchor[:, None])
@@ -131,6 +166,38 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
         np.testing.assert_allclose(previous["anchors"], anchor, rtol=0, atol=0)
         np.testing.assert_allclose(previous["actual"][..., 3], truth, rtol=1e-6, atol=1e-6)
         point["autoregressive"] = point_metrics(truth, previous["baseline"][..., 3], anchor)
+    probabilistic_baselines = {}
+    calibration_path = args.checkpoint.parent / "calibration.npz"
+    if calibration_path.exists():
+        calibration = np.load(calibration_path, allow_pickle=False)
+        x_train, y_train = calibration["features"].astype(float), calibration["targets"].astype(float)
+        # An interpretable conditional reference: historical volatility quartile x session.
+        if covariates is not None:
+            from megatron.bridge.data.datasets.ohlcv_covariates import FORECAST_FEATURE_NAMES
+
+            vol_column = FORECAST_FEATURE_NAMES.index("volatility_60")
+            session_column = FORECAST_FEATURE_NAMES.index("afternoon")
+            boundaries = np.quantile(x_train[:, vol_column], [0.25, 0.5, 0.75])
+            train_group = np.searchsorted(boundaries, x_train[:, vol_column]) + 4 * x_train[:, session_column].astype(
+                int
+            )
+            test_group = np.searchsorted(boundaries, all_inputs[:, -1, vol_column]) + 4 * all_inputs[
+                :, -1, session_column
+            ].astype(int)
+            group_quantiles = np.stack(
+                [np.quantile(y_train[train_group == group], levels, axis=0).T for group in range(8)]
+            )
+            probabilistic_baselines["volatility_session_empirical"] = group_quantiles[test_group]
+        mean, scale = x_train.mean(0), x_train.std(0)
+        scale[scale == 0] = 1
+        train_design = np.column_stack((np.ones(len(x_train)), (x_train - mean) / scale))
+        test_design = np.column_stack((np.ones(len(all_inputs)), (all_inputs[:, -1] - mean) / scale))
+        penalty = np.eye(train_design.shape[1]) * len(x_train)  # fixed ridge alpha=1, no test tuning
+        penalty[0, 0] = 0
+        coefficients = np.linalg.solve(train_design.T @ train_design + penalty, train_design.T @ y_train)
+        ridge_returns = test_design @ coefficients
+        ridge_prices = anchor[:, None] * np.exp(ridge_returns / 100)
+        point["ridge_alpha1"] = point_metrics(truth, ridge_prices, anchor)
     grouped = {}
     symbols = np.asarray([r["exchange"] + r["symbol"] for r in identities])
     dates = np.asarray([r["context_end"][:10] for r in identities])
@@ -153,15 +220,19 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
     differences = np.column_stack(
         (improvement.mean(-1), improvement[:, -1], pinball_difference.mean(-1), pinball_difference[:, -1])
     )
-    # Resample symbols as blocks; all windows belonging to a sampled symbol stay together.
-    blocks = [differences[symbols == key] for key in np.unique(symbols)]
-    rng = np.random.default_rng(payload["run"]["seed"])
-    boot = []
-    for _ in range(1000):
-        selected = rng.integers(len(blocks), size=len(blocks))
-        errors = np.concatenate([blocks[i] for i in selected])
-        boot.append(errors.mean(0))
-    confidence = np.quantile(boot, [0.025, 0.975], axis=0)
+    confidence_by_group = {}
+    for grouping, keys in (("symbol", symbols), ("date", dates)):
+        _, inverse = np.unique(keys, return_inverse=True)
+        sums = np.zeros((inverse.max() + 1, differences.shape[1]))
+        np.add.at(sums, inverse, differences)
+        counts = np.bincount(inverse)
+        rng = np.random.default_rng(payload["run"]["seed"])
+        boot = []
+        for _ in range(1000):
+            selected = rng.integers(len(counts), size=len(counts))
+            boot.append(sums[selected].sum(0) / counts[selected].sum())
+        confidence_by_group[grouping] = np.quantile(boot, [0.025, 0.975], axis=0).tolist()
+    confidence = np.asarray(confidence_by_group["symbol"])
     with args.checkpoint.open("rb") as stream:
         checkpoint_digest = hashlib.file_digest(stream, "sha256").hexdigest()
     report = {
@@ -176,7 +247,12 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
         "checkpoint_sha256": checkpoint_digest,
         "window_selection": "frozen window identities"
         if args.windows
-        else "evenly spaced across stride=horizon inventory",
+        else "evenly spaced across stride-one inventory",
+        "window_stride": stride,
+        "origin_time_counts": {
+            key: int(value)
+            for key, value in zip(*np.unique([r["context_end"][11:16] for r in identities], return_counts=True))
+        },
         "raw_crossing_fraction": float((np.diff(raw_array, axis=-1) < 0).any(-1).mean()),
         "point": point,
         "probabilistic": {
@@ -187,9 +263,11 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
             },
             "sorted": quantile_metrics(target, ordered, levels),
             "empirical": quantile_metrics(target, empirical, levels),
+            **{key: quantile_metrics(target, values, levels) for key, values in probabilistic_baselines.items()},
         },
         "mae_difference_vs_persistence_pct_bootstrap_95ci_path_and_h30": confidence[:, :2].tolist(),
         "pinball_difference_vs_empirical_bps_bootstrap_95ci_path_and_h30": confidence[:, 2:].tolist(),
+        "paired_difference_bootstrap_95ci_by_group": confidence_by_group,
         "grouped": grouped,
         "fixed_examples": fixed.tolist(),
     }
@@ -197,6 +275,9 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
     destination.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     (destination / "windows.json").write_text(json.dumps(windows, indent=2) + "\n")
+    if getattr(args, "metrics_only", False):
+        logger.info("Evaluated %d windows at checkpoint %d", len(windows), payload["step"])
+        return
     np.savez(
         destination / "paths.npz",
         raw=raw_array,

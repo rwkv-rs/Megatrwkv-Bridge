@@ -248,3 +248,64 @@ def test_quantile_targets_share_one_anchor_and_stay_inside_split(prepared):
             )
             assert sample["loss_mask"].sum() == 4
             assert (np.diff(arrays["timestamps"][start : start + 7]) == np.timedelta64(1, "m")).all()
+
+
+def test_covariates_are_causal_and_reset_at_segments():
+    from megatron.bridge.data.datasets.ohlcv_covariates import FORECAST_FEATURE_NAMES, forecast_covariates
+
+    features = np.ones((12, 5), dtype=np.float32) * 0.01
+    timestamps = np.datetime64("2026-01-05T09:30", "us") + np.arange(12) * np.timedelta64(1, "m")
+    segments = np.array([[0, 6, 0], [6, 6, 1]])
+    market = np.zeros((12, 3))
+    original = forecast_covariates(features, timestamps, segments, market)
+    changed = features.copy()
+    changed[9:] *= 2
+    np.testing.assert_array_equal(forecast_covariates(changed, timestamps, segments, market)[:9], original[:9])
+    changed = features.copy()
+    changed[:6] *= 2
+    np.testing.assert_allclose(forecast_covariates(changed, timestamps, segments, market)[6:], original[6:], atol=1e-7)
+    assert original.shape == (12, len(FORECAST_FEATURE_NAMES))
+    assert original[6, FORECAST_FEATURE_NAMES.index("return_60")] == pytest.approx(0.01)
+    assert original[6, FORECAST_FEATURE_NAMES.index("relative_volume_60")] == pytest.approx(0, abs=1e-7)
+
+
+def test_prepared_covariates_keep_labels_and_frozen_indices(prepared, tmp_path):
+    from megatron.bridge.data.datasets.ohlcv import OHLCVQuantileWindowDataset
+    from megatron.bridge.data.datasets.ohlcv_covariates import prepare_covariates
+
+    _, root = prepared
+    output = tmp_path / "covariates"
+    prepare_covariates(root, output, workers=1)
+    np.save(tmp_path / "indices.npy", np.array([1, 0]))
+    original = OHLCVQuantileWindowDataset(root, split="test", seq_length=3, horizon=4)
+    augmented = OHLCVQuantileWindowDataset(
+        root, split="test", seq_length=3, horizon=4, covariates=output, window_indices=tmp_path / "indices.npy"
+    )
+    assert augmented[0]["features"].shape == (3, 23)
+    np.testing.assert_array_equal(augmented[0]["features"][:, :5], original[1]["features"])
+    np.testing.assert_array_equal(augmented[0]["labels"], original[1]["labels"])
+    np.testing.assert_array_equal(augmented[2]["features"], augmented[0]["features"])
+
+
+def test_stratified_window_selection_uses_all_stride_one_origins(prepared, tmp_path):
+    import runpy
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    entry = Path(__file__).resolve().parents[3] / "examples/models/rwkv7/forecast_windows.py"
+    _, root = prepared
+    args = SimpleNamespace(
+        data=root,
+        output=tmp_path / "origins",
+        split="test",
+        count=2,
+        context=3,
+        horizon=4,
+        seed=1234,
+        exclude_dates=None,
+    )
+    runpy.run_path(str(entry))["select_windows"](args)
+    frozen = json.loads(args.output.with_suffix(".json").read_text())
+    assert {r["index"] for r in frozen} == {0, 1}
+    assert all(r["window_stride"] == 1 for r in frozen)
+    assert len({r["context_end"] for r in frozen}) == 2

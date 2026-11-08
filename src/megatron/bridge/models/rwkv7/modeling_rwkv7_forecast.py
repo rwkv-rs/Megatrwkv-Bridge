@@ -27,7 +27,8 @@ class RWKV7ForecastConfig(RWKV7ModelConfig):
         total = float(super()._get_num_floating_point_operations_with_runtime_stats(batch_size, seqlen_sum, **kwargs))
         tokens = seqlen_sum if seqlen_sum is not None else batch_size * self.seq_length
         # Remove the token LM head; add continuous input and task output projections.
-        total += float(tokens * 6 * self.hidden_size * (5 - self.vocab_size))
+        inputs = self.hf_config.get("forecast_input_size", 5)
+        total += float(tokens * 6 * self.hidden_size * (inputs - self.vocab_size))
         if self.hf_config.get("forecast_task", "next_bar") == "direct_quantile":
             outputs = self.hf_config["forecast_horizon"] * len(self.hf_config["forecast_quantiles"])
             return total + float(batch_size * 6 * self.hidden_size * outputs)
@@ -54,7 +55,8 @@ class RWKV7ForecastModel(RWKV7Model):
         super().__init__(model_config, pg_collection)
         self.hf = self.hf.model
         self.hf.embed_tokens = nn.Identity()
-        self.input_projection = nn.Linear(5, model_config.hidden_size, dtype=torch.bfloat16)
+        self.input_size = getattr(self.hf.config, "forecast_input_size", 5)
+        self.input_projection = nn.Linear(self.input_size, model_config.hidden_size, dtype=torch.bfloat16)
         self.direct_quantile = getattr(self.hf.config, "forecast_task", "next_bar") == "direct_quantile"
         if self.direct_quantile:
             self.horizon = self.hf.config.forecast_horizon
@@ -84,11 +86,14 @@ class RWKV7ForecastModel(RWKV7Model):
                 # A separate constant direction keeps zero-volume, unchanged
                 # bars away from the zero-variance input of embedding LayerNorm.
                 weight = torch.empty(
-                    model_config.hidden_size, 6, device=self.input_projection.weight.device, dtype=torch.float32
+                    model_config.hidden_size,
+                    self.input_size + 1,
+                    device=self.input_projection.weight.device,
+                    dtype=torch.float32,
                 )
-                nn.init.orthogonal_(weight, gain=(model_config.hidden_size / 6) ** 0.5)
-                self.input_projection.weight.copy_(weight[:, :5])
-                self.input_projection.bias.copy_(weight[:, 5])
+                nn.init.orthogonal_(weight, gain=(model_config.hidden_size / (self.input_size + 1)) ** 0.5)
+                self.input_projection.weight.copy_(weight[:, : self.input_size])
+                self.input_projection.bias.copy_(weight[:, self.input_size])
                 weight = torch.empty_like(self.output_projection.weight, dtype=torch.float32)
                 nn.init.orthogonal_(weight, gain=self.hf.config.forecast_head_gain)
                 self.output_projection.weight.copy_(weight)
@@ -152,8 +157,8 @@ class RWKV7ForecastModel(RWKV7Model):
         """
         if not self.direct_quantile:
             raise ValueError("predict_quantiles requires a direct_quantile checkpoint.")
-        if context.ndim != 3 or context.shape[1] == 0 or context.shape[-1] != 5:
-            raise ValueError("Expected nonempty [batch, time, 5] context.")
+        if context.ndim != 3 or context.shape[1] == 0 or context.shape[-1] != self.input_size:
+            raise ValueError(f"Expected nonempty [batch, time, {self.input_size}] context.")
         prediction = self(context)
         return prediction.sort(dim=-1).values if fix_quantile_crossing else prediction
 

@@ -468,3 +468,55 @@ FlashRWKV2 0.1.0a18 and TileLang 0.1.15. The model implementation revision was
 `b83bc1963cdfe0697f9bc2f0279a837675c4cddb`. Exact configuration, dependency
 metadata, frozen windows, checkpoint SHA256, raw/sorted arrays, per-minute CSV,
 metrics and figures are preserved in the run artifacts.
+
+### Temporal and market covariates
+
+`prepare-covariates` builds a separate mmap feature cache from the prepared
+snapshot. It retains the five original inputs and appends 18 covariates:
+calendar phase/session, trailing 5/15/30/60-bar returns and RMS returns,
+relative volume, trailing up-bar fraction, and contemporaneous equal-weight
+market return, cross-sectional volatility and up-stock fraction. Every rolling
+calculation resets at the source segment, including session and split boundaries.
+The market universe is the source manifest's instrument inventory. Only completed
+bars at the input timestamp enter its aggregate. The cache manifest records the
+source digest, feature order and temporal contract.
+
+```bash
+timeout 90m uv run --no-sync python examples/models/rwkv7/forecast.py prepare-covariates \
+  --data "$FORECAST_DATA" --output "$FORECAST_COVARIATES" --workers 16
+
+timeout 20m uv run --no-sync python examples/models/rwkv7/forecast.py select-windows \
+  --data "$FORECAST_DATA" --output "$FORECAST_WINDOWS/validation" \
+  --split validation --count 12288 --context 64 --horizon 30 --seed 1234
+```
+
+Selection uses a seeded candidate pool from stride-one inventory and round-robin
+month/intraday-minute strata. It never selects on future prices. JSON records
+include the stride, raw index, instrument and timestamps; NPY stores the same
+indices for the native validation loader. `--exclude-dates old/windows.json`
+excludes complete dates previously inspected when freezing an independent test
+set. Existing 1024-window results remain a separate regression comparison.
+The current same-session 64+30 contract admits 53 origin minutes in this snapshot;
+opening and cross-session forecasts require a separate history-boundary change.
+
+Add `--covariates "$FORECAST_COVARIATES"` and
+`--validation-indices "$FORECAST_WINDOWS/validation.npy"` to direct-quantile
+training. The checkpoint persists input dimensions, ordered feature names and
+feature/validation identity hashes. Calibration uses training windows only.
+`calibration.npz` preserves their final input vectors and cumulative-return
+labels for fixed ridge (alpha=1) and volatility-quartile/session empirical
+references. Neither reference uses test labels for fitting or selection.
+
+The callback saves `best-forecast.pt` for raw pinball and
+`best-median-forecast.pt` for raw median cumulative-return MAE. Compare these
+candidates on the frozen validation set before opening independent test labels;
+use normalized price MAE as the primary point criterion and report conditional
+reference pinball separately. Evaluation batches independent windows, reports
+strict/weak CDFs and discrete calibration violations, and computes paired
+confidence intervals separately with date and symbol blocks. `--metrics-only`
+retains metrics and window identities while skipping arrays, CSV and figures.
+
+Feature references: [Qlib Alpha158](https://github.com/microsoft/qlib/blob/54355232463878d2eebb91fe0ee5fa7fa1f5976c/qlib/contrib/data/loader.py),
+[MASTER](https://github.com/SJTU-DMTai/MASTER/blob/de8f58557096abde4216a701b35fc4368158d111/README.md),
+[Kronos temporal embeddings](https://arxiv.org/html/2508.02739v1), and
+[DeepAR scale/covariate handling](https://arxiv.org/html/1704.04110v3).

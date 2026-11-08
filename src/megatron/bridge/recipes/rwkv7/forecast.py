@@ -78,6 +78,10 @@ class ForecastRun(TypedDict):
     world_size: int
     forecast_references: NotRequired[dict[str, str]]
     sample_budget: NotRequired[dict[str, int]]
+    covariates: NotRequired[str]
+    covariates_sha256: NotRequired[str]
+    validation_indices: NotRequired[str]
+    validation_indices_sha256: NotRequired[str]
 
 
 class ForecastCheckpoint(TypedDict):
@@ -101,6 +105,8 @@ class OHLCVDatasetConfig(DatasetProvider):
     evaluation_samples: int | None = None
     forecast_task: str = "next_bar"
     forecast_horizon: int = 1
+    covariates: str | None = None
+    validation_indices: str | None = None
 
     def build_datasets(
         self, context: DatasetBuildContext
@@ -124,6 +130,10 @@ class OHLCVDatasetConfig(DatasetProvider):
                     keep_tail=self.epochs is not None,
                     epochs=self.epochs if split == "train" else None,
                     cycle_length=self.evaluation_samples if split != "train" else None,
+                    covariates=Path(self.covariates) if self.covariates else None,
+                    window_indices=Path(self.validation_indices)
+                    if split == "validation" and self.validation_indices
+                    else None,
                 )
                 if count > 0
                 else None
@@ -146,6 +156,8 @@ def rwkv7_ohlcv_config(
     eval_iters: int,
     seed: int,
     epochs: int | None = None,
+    covariates: Path | None = None,
+    validation_indices: Path | None = None,
 ) -> ConfigContainer:
     """Build continuous RWKV7 training with fixed, distributed holdout windows.
 
@@ -164,6 +176,9 @@ def rwkv7_ohlcv_config(
         forecast_task=getattr(hf_config, "forecast_task", "next_bar"),
         forecast_horizon=getattr(hf_config, "forecast_horizon", 1),
         evaluation_samples=global_batch_size * eval_iters if eval_iters else None,
+        num_workers=4 if covariates else 2,
+        covariates=str(covariates) if covariates else None,
+        validation_indices=str(validation_indices) if validation_indices else None,
     )
     cfg.model.calculate_per_token_loss = True
     cfg.ddp.average_in_collective = False
@@ -262,9 +277,13 @@ class ForecastExportCallback(Callback):
     def __init__(self, output: Path, *, run: ForecastRun) -> None:
         self.output, self.run = output, run
         self.best_loss = float("inf")
+        self.best_median_loss = float("inf")
         selection = output / "best-validation.json"
         if selection.exists():
             self.best_loss = json.loads(selection.read_text())["pinball"]
+        median_selection = output / "best-median-validation.json"
+        if median_selection.exists():
+            self.best_median_loss = json.loads(median_selection.read_text())["median_return_mae"]
 
     def on_eval_end(self, context: CallbackContext) -> None:
         """Export the earliest minimum on the fixed validation windows."""
@@ -272,7 +291,8 @@ class ForecastExportCallback(Callback):
             return
         assert context.total_loss_dict is not None
         score = float(context.total_loss_dict["forecast pinball"])
-        record = {"step": context.state.train_state.step, "pinball": score}
+        median_score = 2 * float(context.total_loss_dict["forecast/q0.5"])
+        record = {"step": context.state.train_state.step, "pinball": score, "median_return_mae": median_score}
         if torch.distributed.get_rank() == 0:
             with (self.output / "validation.jsonl").open("a") as stream:
                 stream.write(json.dumps(record) + "\n")
@@ -281,6 +301,11 @@ class ForecastExportCallback(Callback):
             if torch.distributed.get_rank() == 0:
                 self._export(context, "best-forecast.pt")
                 (self.output / "best-validation.json").write_text(json.dumps(record, indent=2) + "\n")
+        if median_score < self.best_median_loss:
+            self.best_median_loss = median_score
+            if torch.distributed.get_rank() == 0:
+                self._export(context, "best-median-forecast.pt")
+                (self.output / "best-median-validation.json").write_text(json.dumps(record, indent=2) + "\n")
 
     def _export(self, context: CallbackContext, name: str) -> None:
         model = unwrap_model(context.model)[0]

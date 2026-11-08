@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import math
 import os
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -61,11 +63,16 @@ def train(args: argparse.Namespace) -> None:
     hf.vocab_size = 1
     hf.tie_word_embeddings = False
     direct = getattr(args, "task", "next_bar") == "direct_quantile"
-    dataset_class = OHLCVQuantileWindowDataset if direct else OHLCVWindowDataset
+    dataset_class = partial(OHLCVQuantileWindowDataset, covariates=args.covariates) if direct else OHLCVWindowDataset
     if direct:
         hf.forecast_task = "direct_quantile"
         hf.forecast_horizon = args.forecast_horizon
         hf.forecast_quantiles = [i / 10 for i in range(1, 10)]
+    if args.covariates:
+        from megatron.bridge.data.datasets.ohlcv_covariates import FORECAST_FEATURE_NAMES
+
+        hf.forecast_input_size = len(FORECAST_FEATURE_NAMES)
+        hf.forecast_feature_names = list(FORECAST_FEATURE_NAMES)
     if args.calibration_windows:
         import numpy as np
 
@@ -78,14 +85,18 @@ def train(args: argparse.Namespace) -> None:
             keep_tail=not direct,
             seed=args.seed,
         )
-        total, feature_total, feature_squares = (np.zeros(5, dtype=np.float64) for _ in range(3))
+        total, feature_total, feature_squares = (
+            np.zeros(getattr(hf, "forecast_input_size", 5), dtype=np.float64) for _ in range(3)
+        )
         count = 0
         targets = []
+        calibration_features = []
         for i in range(args.calibration_windows):
             sample = calibration[i * calibration.num_windows // args.calibration_windows]
             mask = sample["loss_mask"].astype(bool)
             if direct:
                 targets.append(sample["labels"])
+                calibration_features.append(sample["features"][-1])
             else:
                 total += sample["labels"][mask].sum(axis=0, dtype=np.float64)
             if args.normalize_inputs:
@@ -142,6 +153,12 @@ def train(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "world_size": int(os.environ.get("WORLD_SIZE", "1")),
     }
+    if args.covariates is not None:
+        run["covariates"] = str(args.covariates)
+        run["covariates_sha256"] = hashlib.sha256((args.covariates / "manifest.json").read_bytes()).hexdigest()
+    if args.validation_indices is not None:
+        run["validation_indices"] = str(args.validation_indices)
+        run["validation_indices_sha256"] = hashlib.sha256(args.validation_indices.read_bytes()).hexdigest()
     if direct:
         samples = args.steps * args.global_batch_size
         run["sample_budget"] = {
@@ -153,6 +170,9 @@ def train(args: argparse.Namespace) -> None:
             "chronos_bolt": "1224fafa91e1ecd6674f5204066b159e40b5e4a1",
             "tft": "0eebfd403ba438bfd14cb70b9b24a7745c997083",
             "timesfm": "e51928e27119cb17bebc005be2696b75e0a9e688",
+            "qlib": "54355232463878d2eebb91fe0ee5fa7fa1f5976c",
+            "master": "de8f58557096abde4216a701b35fc4368158d111",
+            "kronos": "67b630e67f6a18c9e9be918d9b4337c960db1e9a",
         }
     if args.learning_rate_scale != 1.0:
         run["learning_rate_scale"] = args.learning_rate_scale
@@ -178,6 +198,12 @@ def train(args: argparse.Namespace) -> None:
         else:
             args.output.mkdir(parents=True, exist_ok=False)
             (args.output / "run.json").write_text(json.dumps(run, indent=2) + "\n")
+            if direct and args.calibration_windows:
+                np.savez(
+                    args.output / "calibration.npz",
+                    features=np.asarray(calibration_features),
+                    targets=np.asarray(targets),
+                )
             if args.fork_from:
                 (args.output / "fork.json").write_text(
                     json.dumps(
@@ -205,6 +231,8 @@ def train(args: argparse.Namespace) -> None:
         eval_iters=args.eval_iters,
         seed=args.seed,
         epochs=args.epochs,
+        covariates=args.covariates,
+        validation_indices=args.validation_indices,
     )
     cfg.checkpoint.load = str(load) if load else None
     cfg.checkpoint.ckpt_step = args.checkpoint_step
@@ -468,6 +496,8 @@ def main() -> None:
     training.add_argument(
         "--spike-snapshot", action="store_true", help="Save exact pre-update weights at the first detected spike"
     )
+    training.add_argument("--covariates", type=Path, help="Prepared past-only market and temporal feature cache")
+    training.add_argument("--validation-indices", type=Path, help="Frozen stride-one validation index NPY")
     training.set_defaults(handler=train)
     prediction = commands.add_parser("predict", help="Autoregressively generate future OHLCV bars")
     prediction.add_argument("--checkpoint", type=Path, required=True)
@@ -484,9 +514,45 @@ def main() -> None:
     evaluation.add_argument("--max-windows", type=int, default=1000)
     evaluation.add_argument("--windows", type=Path, help="Frozen window identities from an earlier evaluation")
     evaluation.add_argument("--baseline-paths", type=Path, help="Earlier autoregressive prediction NPZ")
+    evaluation.add_argument("--covariates", type=Path, help="Feature cache matching the checkpoint")
+    evaluation.add_argument("--metrics-only", action="store_true", help="Skip large prediction arrays, CSV and plots")
     evaluation.set_defaults(handler=evaluate)
+    covariates = commands.add_parser("prepare-covariates", help="Cache past-only temporal/market covariates")
+    covariates.add_argument("--data", type=Path, required=True)
+    covariates.add_argument("--output", type=Path, required=True)
+    covariates.add_argument("--workers", type=int, required=True)
+
+    def cache_features(args: argparse.Namespace) -> None:
+        from megatron.bridge.data.datasets.ohlcv_covariates import prepare_covariates
+
+        prepare_covariates(args.data, args.output, workers=args.workers)
+
+    covariates.set_defaults(handler=cache_features)
+    selection = commands.add_parser("select-windows", help="Freeze month/time-stratified stride-one windows")
+    selection.add_argument("--data", type=Path, required=True)
+    selection.add_argument("--output", type=Path, required=True)
+    selection.add_argument("--split", choices=("train", "validation", "test"), required=True)
+    selection.add_argument("--count", type=int, required=True)
+    selection.add_argument("--context", type=int, default=64)
+    selection.add_argument("--horizon", type=int, default=30)
+    selection.add_argument("--seed", type=int, default=1234)
+    selection.add_argument("--exclude-dates", type=Path, help="Exclude complete dates from a frozen windows JSON")
+
+    def freeze_windows(args: argparse.Namespace) -> None:
+        from forecast_windows import select_windows
+
+        select_windows(args)
+
+    selection.set_defaults(handler=freeze_windows)
     args = parser.parse_args()
+    if args.command in ("select-windows", "prepare-covariates"):
+        if (args.command == "select-windows" and min(args.count, args.context, args.horizon) <= 0) or (
+            args.command == "prepare-covariates" and args.workers <= 0
+        ):
+            parser.error("Counts, window lengths and worker count must be positive")
     if args.command == "train":
+        if (args.covariates or args.validation_indices) and args.task != "direct_quantile":
+            parser.error("Covariates and frozen validation indices require direct_quantile")
         if args.task == "direct_quantile" and (args.epochs is not None or args.forecast_horizon <= 0):
             parser.error("direct_quantile requires a positive --forecast-horizon and a --steps budget")
         if not math.isfinite(args.learning_rate_scale) or args.learning_rate_scale <= 0:

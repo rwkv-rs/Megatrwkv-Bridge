@@ -291,10 +291,18 @@ class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):
         keep_tail: bool = False,
         epochs: int | None = None,
         cycle_length: int | None = None,
+        covariates: Path | None = None,
+        window_indices: Path | None = None,
     ) -> None:
         if seq_length <= 0 or horizon <= 0 or stride <= 0:
             raise ValueError("seq_length, horizon and stride must be positive.")
         self.root, self.seq_length, self.horizon, self.stride = Path(root), seq_length, horizon, stride
+        self.covariates = covariates
+        self.selection = np.load(window_indices, allow_pickle=False) if window_indices is not None else None
+        if covariates is not None:
+            metadata = json.loads((covariates / "manifest.json").read_text())
+            if metadata["source_manifest_sha256"] != manifest_digest(self.root):
+                raise ValueError("Covariates do not match the prepared dataset manifest.")
         if keep_tail and (stride != seq_length or horizon != 1):
             raise ValueError("Tail windows require stride=seq_length and horizon=1.")
         if epochs is not None and epochs <= 0:
@@ -355,7 +363,10 @@ class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):
         """Locate a window and mmap its instrument; retain only one open shard."""
         if self.cycle_length is not None:
             index %= self.cycle_length
-        index = (index * self.multiplier + self.offset) % self.num_windows
+        if self.selection is not None:
+            index = int(self.selection[index % len(self.selection)])
+        else:
+            index = (index * self.multiplier + self.offset) % self.num_windows
         instrument_index = bisect.bisect_right(self.cumulative, index)
         instrument = self.instruments[instrument_index]
         previous = self.cumulative[instrument_index - 1] if instrument_index else 0
@@ -363,7 +374,12 @@ class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):
         if self._cached_path != instrument["path"]:
             directory = self.root / instrument["path"]
             self._arrays = ShardArrays(
-                features=np.load(directory / "features.npy", mmap_mode="r", allow_pickle=False),
+                features=np.load(
+                    (self.covariates / instrument["path"] if self.covariates is not None else directory)
+                    / "features.npy",
+                    mmap_mode="r",
+                    allow_pickle=False,
+                ),
                 close=np.load(directory / "close.npy", mmap_mode="r", allow_pickle=False),
                 timestamps=np.load(directory / "timestamps.npy", mmap_mode="r", allow_pickle=False),
                 segments=np.load(directory / "segments.npy", mmap_mode="r", allow_pickle=False),
