@@ -76,6 +76,13 @@ class ForecastDiagnosticsCallback(Callback):
 
     def on_train_start(self, context: CallbackContext) -> None:
         """Resolve local optimizer shards and install observational forward hooks."""
+        history = self.output / "steps.jsonl"
+        if history.exists():
+            for line in history.read_text().splitlines():
+                record = json.loads(line)
+                if record["step"] <= context.state.train_state.step:
+                    self.grad_history.append(record["grad_norm"])
+                    self.loss_history.append(record["loss"])
         model = unwrap_model(context.model)[0]
         self.model = model
         self.snapshot_written = (self.output / "spike-before.pt").exists()
@@ -98,7 +105,10 @@ class ForecastDiagnosticsCallback(Callback):
                 records.append(
                     {
                         "parameters": [name for name, _, owner in self.parameters if owner is group],
-                        **{key: group[key] for key in ("lr", "weight_decay", "lr_mult", "wd_mult", "betas", "eps")},
+                        **{
+                            key: group[key]
+                            for key in ("lr", "max_lr", "min_lr", "weight_decay", "lr_mult", "wd_mult", "betas", "eps")
+                        },
                     }
                 )
             (self.output / "optimizer-groups.json").write_text(json.dumps(records, indent=2) + "\n")
@@ -152,6 +162,21 @@ class ForecastDiagnosticsCallback(Callback):
         self.before_model.clear()
         self.grad_history.append(grad_norm)
         self.loss_history.append(loss)
+        if context.state.tensorboard_logger is not None:
+            with (self.output / "steps.jsonl").open("a") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "step": step,
+                            "loss": loss,
+                            "grad_norm": grad_norm,
+                            "grad_spike_ratio": grad_ratio,
+                            "loss_spike_ratio": loss_ratio,
+                            "spike": spike,
+                        }
+                    )
+                    + "\n"
+                )
         for i, ((_, p, _), (lr, wd)) in enumerate(zip(self.parameters, self.hyperparameters)):
             # Dynamic mean-field reference from kexue.fm/archives/11404;
             # this is a diagnostic approximation, not a clipping threshold.

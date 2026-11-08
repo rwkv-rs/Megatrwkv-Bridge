@@ -215,7 +215,7 @@ def test_rwkv_optimizer_group_policy(name, shape, wd_mult, lr_mult):
 
     context = OptimizerConfigOverrideProviderContext(
         model=None,
-        optimizer_config=OptimizerConfig(),
+        optimizer_config=OptimizerConfig(lr=1e-4, min_lr=1e-5),
         scheduler_config=SchedulerConfig(),
     )
     overrides = RWKV7ForecastOptimizerOverrides().build_config_overrides(context)
@@ -225,6 +225,8 @@ def test_rwkv_optimizer_group_policy(name, shape, wd_mult, lr_mult):
     assert all(value.get("lr_mult", lr_mult) == lr_mult for value in matching)
     assert any(value.get("wd_mult") == 0.0 for value in matching) == (wd_mult == 0.0)
     assert any(value.get("lr_mult") == 2.0 for value in matching) == (lr_mult == 2.0)
+    if lr_mult == 2.0:
+        assert any(value.get("max_lr") == 2e-4 and value.get("min_lr") == 2e-5 for value in matching)
 
 
 @pytest.mark.parametrize("magnitude", [1.0, 1e-8, 5e-13, 2e-12, 0.0])
@@ -266,18 +268,19 @@ def test_replay_recurrent_state_orientation_and_token_order():
     torch.testing.assert_close(r.grad[0], torch.stack((initial.sum(-1), final.sum(-1))))
 
 
-def test_lr_rescale_preserves_rwkv_ratios_adam_state_and_scheduler_cursor():
+@pytest.mark.parametrize("legacy", [False, True])
+def test_lr_rescale_preserves_rwkv_ratios_adam_state_and_scheduler_cursor(legacy):
     from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 
-    from megatron.bridge.recipes.rwkv7.forecast import ForecastLearningRateCallback
+    from megatron.bridge.recipes.rwkv7.forecast import ForecastOptimizerCallback
 
     parameters = [torch.nn.Parameter(torch.ones(2)) for _ in range(2)]
     optimizer = torch.optim.AdamW(
         [
             {
                 "params": [parameter],
-                "max_lr": 1e-4 * multiplier,
-                "min_lr": 1e-5 * multiplier,
+                "max_lr": 1e-4 * (1 if legacy else multiplier),
+                "min_lr": 1e-5 * (1 if legacy else multiplier),
                 "lr_mult": multiplier,
                 "wd_mult": 0.0,
             }
@@ -303,7 +306,12 @@ def test_lr_rescale_preserves_rwkv_ratios_adam_state_and_scheduler_cursor():
     )
     scheduler.step(2500)
     base_lr = optimizer.param_groups[0]["lr"]
-    ForecastLearningRateCallback(0.5).on_train_start(SimpleNamespace(scheduler=scheduler))
+    context = SimpleNamespace(
+        scheduler=scheduler,
+        optimizer=optimizer,
+        state=SimpleNamespace(cfg=SimpleNamespace(optimizer=SimpleNamespace(lr=1e-4, min_lr=1e-5))),
+    )
+    ForecastOptimizerCallback(0.5, rwkv_optimizer=True).on_train_start(context)
     assert scheduler.num_steps == 2500
     assert optimizer.param_groups[0]["lr"] == base_lr * 0.5
     assert optimizer.param_groups[1]["lr"] == base_lr

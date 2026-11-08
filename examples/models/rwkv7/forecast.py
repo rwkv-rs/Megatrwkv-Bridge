@@ -47,7 +47,7 @@ def train(args: argparse.Namespace) -> None:
     from megatron.bridge.data.datasets.ohlcv import OHLCVWindowDataset, manifest_digest
     from megatron.bridge.recipes.rwkv7.forecast import (
         ForecastExportCallback,
-        ForecastLearningRateCallback,
+        ForecastOptimizerCallback,
         ForecastRun,
         forecast_forward_step,
         rwkv7_ohlcv_config,
@@ -129,15 +129,18 @@ def train(args: argparse.Namespace) -> None:
     }
     if args.learning_rate_scale != 1.0:
         run["learning_rate_scale"] = args.learning_rate_scale
+    previous_run = json.loads((args.output / "run.json").read_text()) if args.resume else None
+    if args.rwkv_optimizer and (previous_run is None or "optimizer_policy" in previous_run):
+        run["optimizer_policy"] = "rwkv_lm_v2"
     load = args.fork_from / "checkpoints" if args.fork_from else args.resume
     if load and not checkpoint_exists(str(load)):
         raise FileNotFoundError(f"No native training checkpoint found in {load}.")
     if args.fork_from:
         source_run = json.loads((args.fork_from / "run.json").read_text())
         changed = {key for key in run.keys() | source_run.keys() if source_run.get(key) != run.get(key)}
-        if changed - {"learning_rate_scale"}:
+        if changed - {"learning_rate_scale", "optimizer_policy"}:
             raise ValueError(
-                f"Fork requires identical training semantics except learning_rate_scale; changed: {sorted(changed)}"
+                f"Fork requires identical training semantics except LR scale and optimizer policy; changed: {sorted(changed)}"
             )
     if int(os.environ.get("RANK", "0")) == 0:
         if args.resume:
@@ -178,6 +181,11 @@ def train(args: argparse.Namespace) -> None:
     )
     cfg.checkpoint.load = str(load) if load else None
     cfg.checkpoint.ckpt_step = args.checkpoint_step
+    if load and args.rwkv_optimizer:
+        loaded_run = source_run if args.fork_from else previous_run
+        # Legacy checkpoints stored lr_mult=2 but unscaled LR bounds. Construct
+        # their exact group identities before restoring the corrected policy.
+        cfg.optimizer_config_override_provider.apply_lr_bounds = loaded_run.get("optimizer_policy") == "rwkv_lm_v2"
     if args.fork_from:
         # Retain the loaded sample cursor and Adam state, but apply this run's LR
         # endpoints at that same position on the original training schedule.
@@ -185,8 +193,9 @@ def train(args: argparse.Namespace) -> None:
         cfg.scheduler.use_checkpoint_opt_param_scheduler = False
     cfg.train.exit_interval = args.exit_interval
     callbacks = [ForecastExportCallback(args.output, run=run)]
-    if args.learning_rate_scale != 1.0:
-        callbacks.append(ForecastLearningRateCallback(args.learning_rate_scale))
+    official_policy = run.get("optimizer_policy") == "rwkv_lm_v2"
+    if args.learning_rate_scale != 1.0 or official_policy:
+        callbacks.append(ForecastOptimizerCallback(args.learning_rate_scale, rwkv_optimizer=official_policy))
     if args.diagnostics_interval:
         from megatron.bridge.recipes.rwkv7.forecast_diagnostics import ForecastDiagnosticsCallback
 

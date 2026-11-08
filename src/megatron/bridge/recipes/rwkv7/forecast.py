@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 class RWKV7ForecastOptimizerOverrides(OptimizerConfigOverrideProvider):
     """Match RWKV-LM's matrix-only decay and doubled decay-logit learning rate."""
 
+    apply_lr_bounds: bool = True
+
     def build_config_overrides(
         self, context: OptimizerConfigOverrideProviderContext
     ) -> dict[ParamKey, ParamGroupOverride]:
@@ -48,6 +50,11 @@ class RWKV7ForecastOptimizerOverrides(OptimizerConfigOverrideProvider):
         )
         overrides[ParamKey(with_name_predicate=no_decay)] = ParamGroupOverride(wd_mult=0.0)
         overrides[ParamKey(name="*.linear_attn.w0")] = ParamGroupOverride(lr_mult=2.0)
+        if self.apply_lr_bounds:
+            overrides[ParamKey(name="*.linear_attn.w0")].update(
+                max_lr=2 * context.optimizer_config.lr,
+                min_lr=2 * context.optimizer_config.min_lr,
+            )
         return overrides
 
 
@@ -62,6 +69,7 @@ class ForecastRun(TypedDict):
     micro_batch_size: int
     learning_rate: float
     learning_rate_scale: NotRequired[float]
+    optimizer_policy: NotRequired[str]
     warmup_steps: int
     save_interval: int
     eval_interval: int
@@ -206,7 +214,7 @@ def forecast_forward_step(
     )
 
 
-class ForecastLearningRateCallback(Callback):
+class ForecastOptimizerCallback(Callback):
     """Rescale the native scheduler after loading the original optimizer groups.
 
     Core identifies checkpoint groups by their configured LR bounds. Keeping
@@ -214,11 +222,16 @@ class ForecastLearningRateCallback(Callback):
     The native scheduler persists the multiplier and applies it on every step.
     """
 
-    def __init__(self, scale: float) -> None:
-        self.scale = scale
+    def __init__(self, scale: float, *, rwkv_optimizer: bool) -> None:
+        self.scale, self.rwkv_optimizer = scale, rwkv_optimizer
 
     def on_train_start(self, context: CallbackContext) -> None:
         """Apply the requested multiplier at the restored sample cursor."""
+        if self.rwkv_optimizer:
+            for group in context.optimizer.param_groups:
+                if group["lr_mult"] == 2.0:
+                    group["max_lr"] = context.state.cfg.optimizer.lr * 2
+                    group["min_lr"] = context.state.cfg.optimizer.min_lr * 2
         context.scheduler.step_lr_rescale_schedule = ((0, self.scale),)
         context.scheduler.step(0)
 
