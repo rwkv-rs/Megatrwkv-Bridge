@@ -65,6 +65,7 @@ class ForecastDiagnosticsCallback(Callback):
         self.hyperparameters: list[tuple[float, float]] = []
         self.handles: list[Any] = []
         self.activations: dict[str, list[torch.Tensor]] = {}
+        self.activation_sums: dict[str, list[torch.Tensor]] = {}
         self.grad_history: deque[float] = deque(maxlen=100)
         self.loss_history: deque[float] = deque(maxlen=100)
         self.expected_squares: list[torch.Tensor] = []
@@ -139,8 +140,14 @@ class ForecastDiagnosticsCallback(Callback):
     def _activation_hook(self, name: str) -> Any:
         def hook(module: torch.nn.Module, inputs: tuple, output: Any) -> None:
             if self.capture and module.training:
-                value = output[0] if isinstance(output, tuple) else output
-                self.activations.setdefault(name, []).append(tensor_statistics(value))
+                values = [(name, output[0] if isinstance(output, tuple) else output)]
+                if name.endswith("linear_attn"):
+                    values.append((f"{name}.input", inputs[0]))
+                for label, value in values:
+                    self.activations.setdefault(label, []).append(tensor_statistics(value))
+                    self.activation_sums.setdefault(label, []).append(
+                        value.detach().float().sum(dim=tuple(range(value.ndim - 1)))
+                    )
 
         return hook
 
@@ -148,6 +155,7 @@ class ForecastDiagnosticsCallback(Callback):
         """Snapshot sharded FP32 master weights before any optimizer update."""
         self.capture = True
         self.activations.clear()
+        self.activation_sums.clear()
         self.before = [p.detach().clone() for _, p, _ in self.parameters]
         self.hyperparameters = [(group["lr"], group["weight_decay"]) for _, _, group in self.parameters]
         if self.spike_snapshot and not self.snapshot_written:
@@ -305,11 +313,19 @@ class ForecastDiagnosticsCallback(Callback):
             values = torch.stack(values)
             total = values[:, :2].sum(0)
             peak = values[:, 2].max()
+            feature_sum = torch.stack(self.activation_sums[name]).sum(0)
             if distributed:
                 torch.distributed.all_reduce(total)
                 torch.distributed.all_reduce(peak, op=torch.distributed.ReduceOp.MAX)
+                torch.distributed.all_reduce(feature_sum)
             metrics[f"{name}/hidden_rms"] = (total[0] / total[1]).sqrt().item()
             metrics[f"{name}/hidden_absmax"] = peak.item()
+            mean = feature_sum / (total[1] / feature_sum.numel())
+            metrics[f"{name}/hidden_mean"] = mean.mean().item()
+            metrics[f"{name}/hidden_mean_vector_rms"] = mean.square().mean().sqrt().item()
+            metrics[f"{name}/hidden_mean_energy_fraction"] = (
+                mean.square().mean() / (total[0] / total[1]).clamp_min(1e-30)
+            ).item()
         writer = context.state.tensorboard_logger
         if writer is not None:
             for name, value in metrics.items():
