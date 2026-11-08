@@ -9,6 +9,7 @@ from typing import Any, ClassVar
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.utils import parametrize
 
 from megatron.bridge.models.rwkv7.modeling_rwkv7 import RWKV7Model
 from megatron.bridge.models.rwkv7.rwkv7_builder import RWKV7ModelBuilder
@@ -36,6 +37,15 @@ class RWKV7ForecastHead(nn.Linear):
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Project in FP32 while preserving the parameter storage precision."""
         return F.linear(hidden.float(), self.weight.float(), self.bias.float())
+
+
+class _CenteredChannelMixWeight(nn.Module):
+    """Apply post-activation centering through the existing down-projection."""
+
+    def forward(self, weight: torch.Tensor) -> torch.Tensor:
+        """Project out the constant activation direction before BF16 rounding."""
+        value = weight.float()
+        return (value - value.mean(dim=-1, keepdim=True)).to(weight.dtype)
 
 
 class RWKV7ForecastModel(RWKV7Model):
@@ -83,6 +93,9 @@ class RWKV7ForecastModel(RWKV7Model):
                 bias[2:].clamp_(min=torch.finfo(torch.float32).eps)
                 bias[2:] = bias[2:] + torch.log(-torch.expm1(-bias[2:]))
                 self.output_projection.bias.copy_(bias)
+        if getattr(self.hf.config, "forecast_center_channelmix", False):
+            for layer in self.hf.layers:
+                parametrize.register_parametrization(layer.mlp.value, "weight", _CenteredChannelMixWeight())
 
     def forward(
         self,

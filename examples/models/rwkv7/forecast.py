@@ -97,6 +97,8 @@ def train(args: argparse.Namespace) -> None:
         hf.forecast_head_fp32 = True
     if args.rwkv_optimizer:
         hf.forecast_optimizer = "rwkv_lm"
+    if args.center_channelmix:
+        hf.forecast_center_channelmix = True
     # Count actual windows before resolving an epoch-based optimizer-step budget.
     for split in ("train", "validation", "test") if args.eval_iters else ("train",):
         dataset = OHLCVWindowDataset(
@@ -388,6 +390,9 @@ def main() -> None:
     )
     training.add_argument(
         "--rwkv-optimizer", action="store_true", help="Use RWKV-LM matrix-only decay and 2x w0 learning rate"
+    )
+    training.add_argument(
+        "--center-channelmix", action="store_true", help="Train the mean-centered squared-ReLU ChannelMix variant"
     )
     training.add_argument("--diagnostics-interval", type=int, default=0, help="Module/activation metrics interval")
     training.add_argument(

@@ -51,6 +51,37 @@ def test_config_checkpoint_and_parameter_contract(config):
         torch.testing.assert_close(value, model.state_dict()[name], rtol=0, atol=0)
 
 
+def test_centered_channelmix_algebra_and_gradients():
+    from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import _CenteredChannelMixWeight
+
+    weight = torch.randn(4, 16, requires_grad=True)
+    hidden = torch.randn(3, 16).relu().square().requires_grad_()
+    upstream = torch.randn(3, 4)
+    actual = F.linear(hidden, _CenteredChannelMixWeight()(weight))
+    expected = F.linear(hidden - hidden.mean(-1, keepdim=True), weight)
+    actual_grad = torch.autograd.grad(actual, (hidden, weight), upstream, retain_graph=True)
+    expected_grad = torch.autograd.grad(expected, (hidden, weight), upstream)
+    torch.testing.assert_close(actual, expected)
+    for a, b in zip(actual_grad, expected_grad):
+        torch.testing.assert_close(a, b)
+
+
+def test_centered_channelmix_preserves_shared_initialization_and_reload(config):
+    torch.manual_seed(2026)
+    baseline = RWKV7ForecastModel(config, None)
+    config.hf_config["forecast_center_channelmix"] = True
+    torch.manual_seed(2026)
+    centered = RWKV7ForecastModel(config, None)
+    baseline_parameters = dict(baseline.named_parameters())
+    for name, parameter in centered.named_parameters():
+        canonical = name.replace(".parametrizations.weight.original", ".weight")
+        torch.testing.assert_close(parameter, baseline_parameters[canonical], rtol=0, atol=0)
+    restored = RWKV7ForecastModel(config, None)
+    restored.load_state_dict(centered.state_dict(), strict=True)
+    for layer, other in zip(centered.hf.layers, restored.hf.layers):
+        torch.testing.assert_close(layer.mlp.value.weight, other.mlp.value.weight, rtol=0, atol=0)
+
+
 def test_task_head_preserves_alignment_and_gradients(config):
     model = RWKV7ForecastModel(config, None)
     features = torch.randn(2, 8, 5)
@@ -202,6 +233,7 @@ def test_channel_losses_use_identical_mask_and_valid_count():
         ("hf.layers.1.linear_attn.r_k", (1, 64), 0.0, 1.0),
         ("hf.layers.1.linear_attn.g_norm.weight", (64,), 0.0, 1.0),
         ("hf.layers.1.linear_attn.k_proj.weight", (64, 64), 1.0, 1.0),
+        ("hf.layers.1.mlp.value.parametrizations.weight.original", (64, 256), 1.0, 1.0),
         ("output_projection.weight", (5, 64), 1.0, 1.0),
         ("output_projection.bias", (5,), 0.0, 1.0),
     ],
@@ -360,6 +392,7 @@ def test_checkpoint_fork_preserves_source_and_resumes_corrected_groups(tmp_path,
         normalize_inputs=False,
         head_fp32=False,
         rwkv_optimizer=True,
+        center_channelmix=False,
         epochs=None,
         steps=20,
         eval_iters=0,

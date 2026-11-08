@@ -3,6 +3,7 @@
 
 """OHLCV diagnostics for replicated RWKV7 with native AdamW master weights."""
 
+import hashlib
 import json
 import math
 import statistics
@@ -87,6 +88,15 @@ class ForecastDiagnosticsCallback(Callback):
                     self.loss_history.append(record["loss"])
         model = unwrap_model(context.model)[0]
         self.model = model
+        if context.state.tensorboard_logger is not None and context.state.train_state.step == 0:
+            digest = hashlib.sha256()
+            for name, parameter in sorted(model.named_parameters()):
+                canonical = name.replace(".parametrizations.weight.original", ".weight")
+                digest.update(canonical.encode())
+                digest.update(parameter.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+            (self.output / "initialization.json").write_text(
+                json.dumps({"parameter_sha256": digest.hexdigest(), "step": 0}, indent=2) + "\n"
+            )
         self.snapshot_written = (self.output / "spike-before.pt").exists()
         optimizer = context.optimizer
         optimizers = getattr(optimizer, "chained_optimizers", [optimizer])

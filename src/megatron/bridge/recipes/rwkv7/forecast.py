@@ -46,7 +46,9 @@ class RWKV7ForecastOptimizerOverrides(OptimizerConfigOverrideProvider):
         overrides = super().build_config_overrides(context) or {}
         no_decay = ParamWithNamePredicate(
             name="rwkv7_forecast_non_matrix_weight",
-            fn=lambda parameter, name: not (name.endswith(".weight") and parameter.squeeze().ndim >= 2),
+            fn=lambda parameter, name: not (
+                name.endswith((".weight", ".parametrizations.weight.original")) and parameter.squeeze().ndim >= 2
+            ),
         )
         overrides[ParamKey(with_name_predicate=no_decay)] = ParamGroupOverride(wd_mult=0.0)
         overrides[ParamKey(name="*.linear_attn.w0")] = ParamGroupOverride(lr_mult=2.0)

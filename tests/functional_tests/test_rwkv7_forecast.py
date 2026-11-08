@@ -23,17 +23,19 @@ from megatron.bridge.recipes.rwkv7.forecast import rwkv7_ohlcv_config
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA and FlashRWKV2")
 
 
-@pytest.mark.parametrize("initialization", ["linear", "calibrated"])
+@pytest.mark.parametrize("initialization", ["linear", "calibrated", "centered"])
 def test_forecast_gradients_cached_rollout_and_fresh_process_reload(tmp_path, initialization):
     torch.manual_seed(2026)
     hf = RwkvConfig(hidden_size=64, num_hidden_layers=2, vocab_size=1, context_length=16)
-    if initialization == "calibrated":
+    if initialization != "linear":
         hf.forecast_initialization = "calibrated"
         hf.forecast_target_mean = [0.0, 0.0, 0.03, 0.04, 0.85]
         hf.forecast_head_gain = 0.01
         hf.forecast_head_fp32 = True
         hf.forecast_input_mean = [0.0, 0.0, 0.03, 0.04, 0.85]
         hf.forecast_input_std = [0.1, 0.1, 0.05, 0.05, 0.3]
+    if initialization == "centered":
+        hf.forecast_center_channelmix = True
     config = rwkv7_ohlcv_config(
         hf,
         data=tmp_path,
@@ -49,7 +51,7 @@ def test_forecast_gradients_cached_rollout_and_fresh_process_reload(tmp_path, in
         seed=2026,
     ).model
     model = RWKV7ForecastModel(config, None).cuda().train()
-    if initialization == "calibrated":
+    if initialization != "linear":
         silent = torch.zeros(1, 16, 5, device="cuda")
         targets = torch.tensor(hf.forecast_target_mean, device="cuda").expand_as(silent)
         initial_loss = model(silent, labels=targets).mean()

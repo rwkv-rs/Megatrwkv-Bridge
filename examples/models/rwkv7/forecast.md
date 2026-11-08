@@ -300,6 +300,29 @@ inputs on a captured sample. A companion `.pt` stores that sample's operator
 inputs and upstream gradients. `--reference-key` replaces only the selected
 layer's key preparation; `--batch-step` selects another batch at fixed weights.
 
+The snapshot also retains the pre-update FP32 master weights and key-projection
+Adam moments and records the actual key updates. `spike-previous.pt` retains the
+adjacent step with its original data cursor. Compare both weight points on the
+same batch before attributing a large parameter gradient to that parameter's
+own update. For example, replace the preceding layers while keeping the spike
+batch and the remaining spike weights:
+
+```bash
+timeout 10m uv run --no-sync python examples/models/rwkv7/forecast_replay.py \
+  --snapshot runs/ashare-continuation/spike-before.pt \
+  --weights-from runs/ashare-continuation/spike-previous.pt \
+  --replace-parameter 'hf.layers.[0-5].*' \
+  --data DATA/ashare-ohlcv --microbatches 1 \
+  --output runs/ashare-continuation/previous-upstream.json
+```
+
+Omit `--replace-parameter` to substitute all weights, or repeat it for multiple
+groups. The report records the exact replaced parameter names. Use
+`master_state_dict` for interpolation along an optimizer update, casting each
+intermediate weight point to the original model dtype. BF16 endpoint
+interpolation synchronizes one-ULP changes at the midpoint and distorts the
+measured update path.
+
 Training validation now repeats a fixed, seeded selection of holdout windows
 at every evaluation. This separates model changes from changes in evaluation
 stocks and times. Evaluation still covers a subset; free-running metrics use
