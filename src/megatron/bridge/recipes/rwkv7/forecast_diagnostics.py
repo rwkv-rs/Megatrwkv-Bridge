@@ -74,6 +74,7 @@ class ForecastDiagnosticsCallback(Callback):
         self.model: torch.nn.Module | None = None
         self.before_model: dict[str, torch.Tensor] = {}
         self.before_key_optimizer: dict[str, Any] = {}
+        self.previous_snapshot: dict[str, Any] = {}
 
     def on_train_start(self, context: CallbackContext) -> None:
         """Resolve local optimizer shards and install observational forward hooks."""
@@ -163,6 +164,8 @@ class ForecastDiagnosticsCallback(Callback):
         spike = len(self.grad_history) == 100 and (grad_ratio > 5 or loss_ratio > 1.2)
         if spike and self.spike_snapshot and not self.snapshot_written:
             if context.state.tensorboard_logger is not None:
+                if self.previous_snapshot:
+                    torch.save(self.previous_snapshot, self.output / "spike-previous.pt")
                 torch.save(
                     {
                         "version": 1,
@@ -187,6 +190,24 @@ class ForecastDiagnosticsCallback(Callback):
                     self.output / "spike-before.pt",
                 )
             self.snapshot_written = True
+            self.previous_snapshot = {}
+        elif self.spike_snapshot and not self.snapshot_written:
+            # Retain the adjacent pre-update model, not a reconstruction from
+            # rounded weights. These tensors are already detached clones.
+            self.previous_snapshot = {
+                "version": 1,
+                "run": json.loads((self.output / "run.json").read_text()),
+                "step": step - 1,
+                "diagnostic_step": step,
+                "consumed_samples_before_step": context.state.train_state.consumed_train_samples,
+                "state_dict": self.before_model.copy(),
+                "key_optimizer_before": self.before_key_optimizer.copy(),
+                "key_optimizer_after": {
+                    name: {"master": master.detach().clone(), "gradient": master.grad.detach().clone()}
+                    for name, master, _ in self.parameters
+                    if name in self.before_key_optimizer
+                },
+            }
         self.before_model.clear()
         self.before_key_optimizer.clear()
         self.grad_history.append(grad_norm)
