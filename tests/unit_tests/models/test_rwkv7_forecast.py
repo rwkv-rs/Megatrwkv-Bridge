@@ -269,6 +269,24 @@ def test_replay_recurrent_state_orientation_and_token_order():
     torch.testing.assert_close(r.grad[0], torch.stack((initial.sum(-1), final.sum(-1))))
 
 
+def test_readout_reference_head_normalization_and_rkv_gradients():
+    entry = Path(__file__).resolve().parents[3] / "examples/models/rwkv7/forecast_replay.py"
+    reference = runpy.run_path(str(entry))["reference_readout"]
+    x = torch.zeros(1, 1, 4, dtype=torch.bfloat16, requires_grad=True)
+    r = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], dtype=torch.bfloat16)
+    v = r.detach().clone().requires_grad_()
+    k = torch.ones_like(r)
+    residual = torch.tensor([[0.5, 0.25], [0.125, 0.25]], dtype=torch.bfloat16)
+    weight = torch.full((4,), 2.0, dtype=torch.bfloat16)
+    bias = torch.ones(4, dtype=torch.bfloat16)
+    gate = torch.tensor([[[0.5, 0.5, 0.25, 0.25]]], dtype=torch.bfloat16)
+    result = reference(x, r, k, v, residual, weight, bias, gate, head_size=2)
+    torch.testing.assert_close(result, torch.tensor([[[1.0, 1.5, 1.28125, 1.625]]], dtype=torch.bfloat16))
+    (result[..., 0].float() + result[..., 2].float()).sum().backward()
+    torch.testing.assert_close(x.grad, torch.tensor([[[20.0, -20.0, 10.0, -10.0]]], dtype=torch.bfloat16))
+    torch.testing.assert_close(v.grad, torch.tensor([[[0.5, 0.0, 0.34375, 0.0]]], dtype=torch.bfloat16))
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_lr_rescale_preserves_rwkv_ratios_adam_state_and_scheduler_cursor(legacy):
     from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler

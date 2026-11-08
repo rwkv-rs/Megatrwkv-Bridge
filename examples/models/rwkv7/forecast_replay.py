@@ -89,6 +89,28 @@ def reference_recurrent(
     return torch.stack(outputs, dim=1).flatten(-2), state
 
 
+def reference_readout(
+    x: torch.Tensor,
+    r: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    r_k: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    gate: torch.Tensor,
+    head_size: int = 64,
+    eps: float = 64e-5,
+) -> torch.Tensor:
+    """Match FP32 head normalization, RKV residual, gate, then BF16 rounding."""
+    values = x.float().unflatten(-1, (-1, head_size))
+    centered = values - values.mean(-1, keepdim=True)
+    normalized = centered * torch.rsqrt(centered.square().mean(-1, keepdim=True) + eps)
+    residual = (r.float() * k.float() * r_k.float().flatten()).unflatten(-1, (-1, head_size)).sum(-1, keepdim=True)
+    result = normalized.flatten(-2) * weight.float() + bias.float()
+    result = result + (residual * v.float().unflatten(-1, (-1, head_size))).flatten(-2)
+    return (result * gate.float()).bfloat16()
+
+
 def main() -> None:
     """Reconstruct native sampler order and compare key branches on one GPU."""
     from forecast import load_forecaster
@@ -100,8 +122,14 @@ def main() -> None:
     parser.add_argument("--layer", type=int, default=6, help="Zero-based layer index")
     parser.add_argument("--reference-key", action="store_true", help="Swap only key preparation for the reference")
     parser.add_argument("--check-recurrent", action="store_true", help="Compare a captured sample's recurrent VJP")
+    parser.add_argument("--check-readout", action="store_true", help="Compare readout and inspect head variances")
+    parser.add_argument("--reference-readout", action="store_true", help="Swap the selected layer's readout")
+    parser.add_argument("--check-norms", action="store_true", help="Trace all LayerNorm input/gradient scales")
+    parser.add_argument("--microbatches", type=int, help="Bound the number of original rank microbatches replayed")
     parser.add_argument("--batch-step", type=int, help="One-based data step; defaults to snapshot diagnostic step")
     args = parser.parse_args()
+    if args.microbatches is not None and args.microbatches <= 0:
+        parser.error("--microbatches must be positive")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO)
     torch.set_num_threads(4)
@@ -156,9 +184,40 @@ def main() -> None:
     handles = [attention.register_forward_pre_hook(enter), attention.register_forward_hook(leave)]
     # The fused projection bypasses nn.Linear.forward; capture x_k at its public operator boundary.
     import flashrwkv2
+    import flashrwkv2.tmix.readout.tilelang as readout_module
 
     original_prepare = flashrwkv2.pretrain_tmix_wkv_prepare_bf16
     original_recurrent = flashrwkv2.pretrain_tmix_wkv7_recurrent_bf16
+    original_readout = readout_module.readout
+    original_norm = flashrwkv2.infer_embedding_ln0_forward_varlen
+    norm_names = {
+        module.weight.data_ptr(): name
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.LayerNorm)
+    }
+    norm_captures: dict[str, tuple] = {}
+
+    def readout(*inputs: Any, **kwargs: Any) -> torch.Tensor:
+        implementation = (
+            reference_readout if args.reference_readout and captured.get("active", False) else original_readout
+        )
+        output = implementation(*inputs, **kwargs)
+        if args.check_readout and captured.get("active", False):
+            captured["readout_inputs"] = inputs[:8]
+            captured["readout_output"] = output
+            output.retain_grad()
+        return output
+
+    def layer_norm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        if not args.check_norms:
+            return original_norm(x, weight, bias, **kwargs)
+        # A view isolates the norm branch's VJP from the residual skip's VJP.
+        branch = x.view_as(x)
+        result = original_norm(branch, weight, bias, **kwargs)
+        branch.retain_grad()
+        result.retain_grad()
+        norm_captures[norm_names[weight.data_ptr()]] = (branch, result, weight, bias, kwargs["eps"])
+        return result
 
     def prepare(*inputs: torch.Tensor, **kwargs: Any) -> Any:
         if captured.get("active", False):
@@ -182,9 +241,15 @@ def main() -> None:
         patch.object(prepare_module, "prepare_key", probe),
         patch.object(flashrwkv2, "pretrain_tmix_wkv_prepare_bf16", prepare),
         patch.object(flashrwkv2, "pretrain_tmix_wkv7_recurrent_bf16", recurrent),
+        patch.object(readout_module, "readout", readout),
+        patch.object(flashrwkv2, "infer_embedding_ln0_forward_varlen", layer_norm),
     ):
         for offset in range(0, run["global_batch_size"], micro * world):
+            if args.microbatches is not None and len(records) >= args.microbatches:
+                break
             for rank in range(world):
+                if args.microbatches is not None and len(records) >= args.microbatches:
+                    break
                 start = consumed + offset + rank * micro
                 samples = [dataset[index] for index in range(start, start + micro)]
                 batch = {name: torch.from_numpy(np.stack([s[name] for s in samples])).cuda() for name in samples[0]}
@@ -291,6 +356,65 @@ def main() -> None:
                     artifact["recurrent_inputs"] = tuple(x.detach().cpu() for x in leaf)
                     artifact["recurrent_upstream"] = dy.cpu()
                     torch.save(artifact, args.output.with_suffix(".pt"))
+                if args.check_readout:
+                    readout_inputs = captured["readout_inputs"]
+                    readout_upstream = captured["readout_output"].grad
+                    readout_leaves = tuple(x.detach().requires_grad_() for x in readout_inputs)
+                    expected_readout = reference_readout(*readout_leaves, head_size=head_size)
+                    actual_readout = original_readout(*readout_leaves, head_size=head_size)
+                    expected_grads = torch.autograd.grad(expected_readout, readout_leaves, readout_upstream)
+                    actual_grads = torch.autograd.grad(actual_readout, readout_leaves, readout_upstream)
+                    values = readout_inputs[0].float().unflatten(-1, (-1, head_size))
+                    variance = values.var(-1, unbiased=False)
+                    gain = actual_grads[0].float().unflatten(-1, (-1, head_size)).norm(dim=-1)
+                    gain /= readout_upstream.float().unflatten(-1, (-1, head_size)).norm(dim=-1).clamp_min(1e-30)
+                    record["readout"] = {
+                        "forward": comparison(actual_readout, expected_readout),
+                        "backward": {
+                            name: comparison(a, b)
+                            for name, a, b in zip(
+                                ("x", "r", "k", "v", "r_k", "weight", "bias", "gate"), actual_grads, expected_grads
+                            )
+                        },
+                        "head_variance": [norm_summary(variance[..., h][valid]) for h in range(variance.shape[-1])],
+                        "head_vjp_gain": [norm_summary(gain[..., h][valid]) for h in range(variance.shape[-1])],
+                    }
+                    if offset == 0 and rank == 0:
+                        artifact = torch.load(args.output.with_suffix(".pt"), weights_only=True)
+                        artifact["readout_inputs"] = tuple(x.detach().cpu() for x in readout_inputs)
+                        artifact["readout_upstream"] = readout_upstream.cpu()
+                        torch.save(artifact, args.output.with_suffix(".pt"))
+                if args.check_norms:
+                    norm_records = {}
+                    for name, (norm_input, norm_output, weight, bias, eps) in norm_captures.items():
+                        variance = norm_input.float().var(-1, unbiased=False)
+                        norm_gain = norm_input.grad.float().norm(dim=-1) / norm_output.grad.float().norm(
+                            dim=-1
+                        ).clamp_min(1e-30)
+                        selected = torch.unravel_index(norm_gain.masked_fill(~valid, -1).argmax(), norm_gain.shape)
+                        nb, nt = (int(value.item()) for value in selected)
+                        leaf_x = norm_input[nb : nb + 1, nt : nt + 1].detach().contiguous().requires_grad_()
+                        leaf_w, leaf_b = weight.detach().requires_grad_(), bias.detach().requires_grad_()
+                        upstream_norm = norm_output.grad[nb : nb + 1, nt : nt + 1].contiguous()
+                        expected_norm = F.layer_norm(
+                            leaf_x.float(), (leaf_x.shape[-1],), leaf_w.float(), leaf_b.float(), eps
+                        ).bfloat16()
+                        actual_norm = original_norm(leaf_x, leaf_w, leaf_b, eps=eps)
+                        expected_vjp = torch.autograd.grad(expected_norm, (leaf_x, leaf_w, leaf_b), upstream_norm)
+                        actual_vjp = torch.autograd.grad(actual_norm, (leaf_x, leaf_w, leaf_b), upstream_norm)
+                        norm_records[name] = {
+                            "input_variance": norm_summary(variance[valid]),
+                            "vjp_gain": norm_summary(norm_gain[valid]),
+                            "largest_gain_location": {
+                                "sample_index": start + nb,
+                                "time": nt,
+                                "variance": variance[nb, nt].item(),
+                            },
+                            "forward": comparison(actual_norm, expected_norm),
+                            "backward": [comparison(a, b) for a, b in zip(actual_vjp, expected_vjp)],
+                        }
+                    record["layer_norms"] = norm_records
+                    norm_captures.clear()
                 records.append(record)
                 logger.info(
                     "rank=%s microbatch=%s %s", rank, record["microbatch"], record["largest_direction_gradient"]
