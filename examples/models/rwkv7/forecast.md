@@ -524,3 +524,70 @@ Feature references: [Qlib Alpha158](https://github.com/microsoft/qlib/blob/54355
 [MASTER](https://github.com/SJTU-DMTai/MASTER/blob/de8f58557096abde4216a701b35fc4368158d111/README.md),
 [Kronos temporal embeddings](https://arxiv.org/html/2508.02739v1), and
 [DeepAR scale/covariate handling](https://arxiv.org/html/1704.04110v3).
+
+### Recorded covariate experiment (2026-11-08)
+
+The covariate run retained the 24-layer, width-256 RWKV7 backbone, seed 1234,
+64/30 context/horizon, standard pinball objective, learning-rate schedule and
+3592-step budget. It used 23 inputs, eight-way data parallelism, global batch
+12288, microbatch 768 and four persistent data-loader workers per rank.
+Training implementation revision: `0fdda583a44ad54f823e0f1c872c94652ac36b25`.
+The selected step-500 checkpoint SHA256 was
+`6619c5b697de383ff66b207766d6b529e09a446c3a92a1307957cba234d91bb0`.
+
+The fixed validation set contained 12288 month/minute-stratified windows across
+53 eligible intraday origin minutes. Raw validation pinball was 0.15349910 at
+step 500, 0.16264886 at step 1000 and 0.17083074 at step 3592. Both validation
+criteria selected step 500. A fresh process reproduced its raw pinball within
+0.0001 bp. Selection used validation only; the framework's incidental final test
+summary did not enter selection. The recipe now omits that native test loader.
+
+The fixed test cohort excluded all 365 dates in the previously inspected
+1024-window cohort. It contained 4096 windows from 2919 instruments across 21
+remaining dates, with origins between 2025-01-13 and 2026-07-24 and all 53 eligible
+origin minutes. Original and new models used identical window identities,
+anchors, actual closes and timestamps.
+
+| Metric | Last close | Previous direct model | Covariate model | Fixed ridge |
+|---|---:|---:|---:|---:|
+| Whole-path median/point MAE (%) | 0.305990 | 0.304305 | 0.307722 | 0.308657 |
+| Minute-30 MAE (%) | 0.437482 | 0.434198 | 0.436400 | 0.440244 |
+| Minute-30 RMSE (%) | 0.716538 | 0.720872 | 0.712640 | 0.717806 |
+| Minute-30 return-error bias (bp) | 1.7411 | -1.8783 | -5.6527 | 0.7580 |
+| Sorted pinball (bp) | — | 12.06683 | 12.23144 | — |
+
+The unconditional and volatility-quartile/session empirical references scored
+12.84557 and 12.57593 bp, respectively. The covariate model improved conditional
+reference pinball by 2.74%; its paired date-block 95% confidence interval for the
+whole-path difference was [-0.68069, -0.07328] bp. Its point-MAE difference against
+last close was +0.001732 percentage points, with date-block interval
+[-0.00682, 0.00897]. The point objective did not improve. Against the previous
+direct model, the mean point difference was +0.003417 percentage points and the
+date-block interval was [-0.00537, 0.01004].
+
+The 60%/80% intervals covered 60.51%/80.05%, with mean widths 58.38/93.64 bp
+and interval scores 112.88/150.09 bp. Raw quantile crossing occurred in 1.41% of
+window/horizon pairs. On the original 1024-window regression cohort, the
+covariate model's whole-path MAE was 0.314930%, versus 0.313271% for the previous
+direct model and 0.313369% for last close. Its minute-30 return bias was -8.0343
+bp, compared with -4.6983 bp for the reused recursive model.
+
+The final step-3592 model achieved 0.291659% MAE on fixed training-period windows,
+versus 0.359834% for last close, while validation deteriorated. This run provides
+concrete evidence of a training/generalization gap. Adding this feature package
+did not improve the primary point objective and does not replace the previous
+model. The next controlled experiment should address temporal adaptation and
+earlier validation-based stopping before expanding model size or training time.
+
+Training and final export took 92.30 minutes. Median logged iteration time after
+the first 100 steps was 1.3376 seconds, corresponding to 587943 historical
+bars/second. The run processed 44138496 windows, 2824863744 historical bars and
+1324154880 future targets. Both half-hour inspections observed 100% utilization
+on all eight GPUs; the initial 20-second sample averaged 89.70–96.05% per GPU.
+Peak allocated memory was 25.68 GiB per rank. No spike events, skipped updates or
+NaN iterations were observed; maximum raw gradient norm was 0.15450.
+
+All 71 related unit tests and all-file pre-commit checks passed. Strict mypy
+reported no errors in five of seven changed implementation files; model/recipe
+checking still reports inherited framework `Any` types and dependent return-type
+errors. The full check log is retained with the runtime artifacts.
