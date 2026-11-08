@@ -237,10 +237,68 @@ statistics. Constant channels use a scale of one. This option requires a positiv
 `--rwkv-optimizer` selects RWKV-LM's parameter groups: only matrix parameters
 whose names end in `.weight` receive weight decay; TimeMix vectors, low-rank
 factors and biases do not. The `w0` decay logits use twice the base learning rate.
-This follows the reference's `configure_optimizers`, rather than treating a
+The recipe sets both native scheduler bounds (`max_lr`, `min_lr`) for `w0`;
+`lr_mult` metadata alone does not change the current scheduler's applied rate.
+`optimizer-groups.json` records actual rates and bounds after checkpoint loading.
+This follows [`train_temp`'s `configure_optimizers` and callback](https://github.com/BlinkDL/RWKV-LM/tree/main/RWKV-v7/train_temp/src), rather than treating a
 `[1, 1, hidden]` TimeMix vector as a decay-eligible matrix. The policy is persisted
 as `forecast_optimizer` and must be evaluated in a separate run because it
 changes optimizer groups and training semantics.
+
+New runs additionally record `optimizer_policy=rwkv_lm_v2` in `run.json`.
+Resuming an older run preserves that run's original policy. To apply the
+corrected scheduler bounds to an older checkpoint, create a separate continuation
+with `--fork-from SOURCE_RUN --checkpoint-step STEP`. The loader constructs the
+source parameter groups, restores the FP32 master weights and Adam moments, then
+applies the requested policy before the first training update. Subsequent native
+checkpoints preserve the corrected groups for normal `--resume`.
+
+`--learning-rate-scale 0.5` multiplies the native scheduler's output uniformly,
+preserving the RWKV-LM 1x/2x ratios, schedule position, and checkpoint parameter
+group identities. Keep `--learning-rate` at the source run's value when forking.
+All data, model, batch, seed, and original training-horizon settings must match;
+the continuation permits changes to the scale and optimizer policy. `fork.json`
+records the source configuration and checkpoint iteration.
+
+For example, continue an existing one-epoch experiment from iteration 2500 and
+stop at iteration 2750 while retaining its full learning-rate schedule:
+
+```bash
+timeout 1h uv run --no-sync python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  examples/models/rwkv7/forecast.py train \
+  --config examples/models/rwkv7/forecast-l24-d256.json \
+  --data DATA/ashare-ohlcv --output runs/ashare-continuation \
+  --fork-from runs/ashare-source --checkpoint-step 2500 \
+  --epochs 1 --context 64 --global-batch-size 12288 --micro-batch-size 512 \
+  --learning-rate 1e-4 --learning-rate-scale 0.5 --warmup-steps 100 \
+  --save-interval 500 --eval-interval 500 --eval-iters 10 --exit-interval 2750 \
+  --calibration-windows 4096 --head-gain 0.01 --head-fp32 --normalize-inputs \
+  --rwkv-optimizer --diagnostics-interval 10 --spike-snapshot
+```
+
+The callback also writes `steps.jsonl` with loss and pre-clipping gradient norm
+at every step. It reloads the preceding history on resume so the 100-step spike
+window continues across checkpoint boundaries.
+
+### Exact spike replay
+
+Replay a captured global batch on one GPU, retaining the original rank and
+microbatch order and accumulating parameter gradients in FP32:
+
+```bash
+timeout 10m uv run --no-sync python examples/models/rwkv7/forecast_replay.py \
+  --snapshot runs/ashare-continuation/spike-before.pt \
+  --data DATA/ashare-ohlcv --check-recurrent \
+  --output runs/ashare-continuation/spike-replay.json
+```
+
+The report includes per-head key-norm distributions for valid and padded
+positions, raw-key and normalized-direction gradient contributions, their
+alignment, and fused-versus-reference forward/backward differences. The optional
+recurrent comparison checks output, final FP32 state, and gradients of all six
+inputs on a captured sample. A companion `.pt` stores that sample's operator
+inputs and upstream gradients. `--reference-key` replaces only the selected
+layer's key preparation; `--batch-step` selects another batch at fixed weights.
 
 Training validation now repeats a fixed, seeded selection of holdout windows
 at every evaluation. This separates model changes from changes in evaluation

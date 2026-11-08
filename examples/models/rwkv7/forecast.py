@@ -187,8 +187,8 @@ def train(args: argparse.Namespace) -> None:
         # their exact group identities before restoring the corrected policy.
         cfg.optimizer_config_override_provider.apply_lr_bounds = loaded_run.get("optimizer_policy") == "rwkv_lm_v2"
     if args.fork_from:
-        # Retain the loaded sample cursor and Adam state, but apply this run's LR
-        # endpoints at that same position on the original training schedule.
+        # Retain the loaded sample cursor and Adam state on the original
+        # schedule. The callback applies the requested policy after loading.
         cfg.scheduler.override_opt_param_scheduler = True
         cfg.scheduler.use_checkpoint_opt_param_scheduler = False
     cfg.train.exit_interval = args.exit_interval

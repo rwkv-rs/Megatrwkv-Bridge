@@ -9,6 +9,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import numpy as np
@@ -125,12 +126,18 @@ def main() -> None:
     import flashrwkv2.tmix.wkv_prepare.tilelang as prepare_module
 
     original = prepare_module.prepare_key
-    captured: dict = {}
+    captured: dict[str, Any] = {}
     head_size = model.hf.config.head_size
 
-    def probe(key, scale, rate, rate_scale, size):
+    def probe(
+        key: torch.Tensor,
+        scale: torch.Tensor,
+        rate: torch.Tensor,
+        rate_scale: torch.Tensor,
+        size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         implementation = reference_key if args.reference_key and captured.get("active", False) else original
-        output = implementation(key, scale, rate, rate_scale, size)
+        output: tuple[torch.Tensor, torch.Tensor, torch.Tensor] = implementation(key, scale, rate, rate_scale, size)
         if captured.get("active", False):
             captured["inputs"] = (key, scale, rate, rate_scale)
             captured["outputs"] = output
@@ -140,10 +147,10 @@ def main() -> None:
 
     attention = model.hf.layers[args.layer].linear_attn
 
-    def enter(module, inputs):
+    def enter(module: torch.nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
         captured["active"] = True
 
-    def leave(module, inputs, output):
+    def leave(module: torch.nn.Module, inputs: tuple[torch.Tensor, ...], output: Any) -> None:
         captured["active"] = False
 
     handles = [attention.register_forward_pre_hook(enter), attention.register_forward_hook(leave)]
@@ -153,13 +160,13 @@ def main() -> None:
     original_prepare = flashrwkv2.pretrain_tmix_wkv_prepare_bf16
     original_recurrent = flashrwkv2.pretrain_tmix_wkv7_recurrent_bf16
 
-    def prepare(*inputs, **kwargs):
+    def prepare(*inputs: torch.Tensor, **kwargs: Any) -> Any:
         if captured.get("active", False):
             captured["xk"] = inputs[2].detach()
         return original_prepare(*inputs, **kwargs)
 
-    def recurrent(*inputs, **kwargs):
-        output = original_recurrent(*inputs, **kwargs)
+    def recurrent(*inputs: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        output: torch.Tensor = original_recurrent(*inputs, **kwargs)
         if args.check_recurrent and captured.get("active", False):
             captured["recurrent_inputs"] = inputs
             captured["recurrent_output"] = output
@@ -197,7 +204,7 @@ def main() -> None:
                 outputs = captured["outputs"]
                 gradients = tuple(tensor.grad.detach() for tensor in outputs)
                 leaves = tuple(tensor.detach().requires_grad_() for tensor in inputs)
-                reference = reference_key(*leaves, head_size)
+                reference = reference_key(leaves[0], leaves[1], leaves[2], leaves[3], head_size)
                 expected = torch.autograd.grad(reference, leaves, gradients)
                 actual = original(*leaves, head_size)
                 actual_gradients = torch.autograd.grad(actual, leaves, gradients)
@@ -210,7 +217,13 @@ def main() -> None:
                     "sample_start": start,
                     "valid_key_norm": norm_summary(norms[valid]),
                     "padding_key_norm": norm_summary(norms[~valid]),
-                    "heads": [norm_summary(norms[..., head][valid]) for head in range(norms.shape[-1])],
+                    "heads": [
+                        {
+                            "valid": norm_summary(norms[..., head][valid]),
+                            "padding": norm_summary(norms[..., head][~valid]),
+                        }
+                        for head in range(norms.shape[-1])
+                    ],
                     "forward": [comparison(a, b) for a, b in zip(actual, reference)],
                     "backward": [comparison(a, b) for a, b in zip(actual_gradients, expected)],
                 }
@@ -220,7 +233,9 @@ def main() -> None:
                     upstream = tuple(
                         g if (i == 0) == (branch == 0) else torch.zeros_like(g) for i, g in enumerate(gradients)
                     )
-                    dk = torch.autograd.grad(reference_key(*leaf, head_size), leaf, upstream)[0]
+                    dk = torch.autograd.grad(
+                        reference_key(leaf[0], leaf[1], leaf[2], leaf[3], head_size), leaf, upstream
+                    )[0]
                     branch_keys.append(dk.float())
                     branches[branch].add_(dk.flatten(0, 1).float().T @ captured["xk"].flatten(0, 1).float())
                 upstream_direction = -gradients[1].float() + gradients[2].float() * rate.float()

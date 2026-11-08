@@ -105,6 +105,12 @@ class ForecastDiagnosticsCallback(Callback):
                 records.append(
                     {
                         "parameters": [name for name, _, owner in self.parameters if owner is group],
+                        "optimizer_step": int(group.get("step", 0)),
+                        "adam_state_parameters": sum(
+                            "exp_avg" in state_owner.state[parameter]
+                            for (_, parameter, owner), state_owner in zip(self.parameters, self.state_owners)
+                            if owner is group
+                        ),
                         **{
                             key: group[key]
                             for key in ("lr", "max_lr", "min_lr", "weight_decay", "lr_mult", "wd_mult", "betas", "eps")

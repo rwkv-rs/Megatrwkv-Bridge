@@ -1,5 +1,6 @@
 """Continuous task heads, state lifecycle, serialization and native loss counts."""
 
+import json
 import runpy
 from pathlib import Path
 from types import SimpleNamespace
@@ -325,3 +326,66 @@ def test_lr_rescale_preserves_rwkv_ratios_adam_state_and_scheduler_cursor(legacy
     assert optimizer.param_groups[0]["lr"] == base_lr * 0.5
     scheduler.step(1)
     assert optimizer.param_groups[1]["lr"] == optimizer.param_groups[0]["lr"] * 2
+
+
+def test_checkpoint_fork_preserves_source_and_resumes_corrected_groups(tmp_path, monkeypatch):
+    entry = Path(__file__).resolve().parents[3] / "examples/models/rwkv7/forecast.py"
+    train = runpy.run_path(str(entry))["train"]
+    architecture = tmp_path / "architecture.json"
+    RwkvConfig(hidden_size=64, num_hidden_layers=2, context_length=16).to_json_file(architecture)
+    args = SimpleNamespace(
+        config=architecture,
+        data=tmp_path / "data",
+        output=tmp_path / "source",
+        context=16,
+        calibration_windows=0,
+        normalize_inputs=False,
+        head_fp32=False,
+        rwkv_optimizer=True,
+        epochs=None,
+        steps=20,
+        eval_iters=0,
+        warmup_steps=0,
+        global_batch_size=2,
+        micro_batch_size=1,
+        learning_rate=1e-4,
+        learning_rate_scale=1.0,
+        save_interval=10,
+        eval_interval=10,
+        seed=2026,
+        resume=None,
+        fork_from=None,
+        checkpoint_step=None,
+        exit_interval=None,
+        diagnostics_interval=0,
+        spike_snapshot=False,
+    )
+    captured = []
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("RANK", "0")
+    with (
+        patch("megatron.bridge.data.datasets.ohlcv.OHLCVWindowDataset", return_value=SimpleNamespace(num_windows=20)),
+        patch("megatron.bridge.data.datasets.ohlcv.manifest_digest", return_value="fixed-manifest"),
+        patch("megatron.bridge.training.utils.checkpoint_utils.checkpoint_exists", return_value=True),
+        patch(
+            "megatron.bridge.training.pretrain.pretrain", side_effect=lambda cfg, forward, **kw: captured.append(cfg)
+        ),
+    ):
+        train(args)
+        source = args.output
+        legacy = json.loads((source / "run.json").read_text())
+        legacy.pop("optimizer_policy")
+        original = json.dumps(legacy)
+        (source / "run.json").write_text(original)
+        args.output = tmp_path / "continuation"
+        args.fork_from, args.checkpoint_step, args.learning_rate_scale = source, 10, 0.5
+        train(args)
+        assert (source / "run.json").read_text() == original
+        assert captured[-1].checkpoint.load == str(source / "checkpoints")
+        assert captured[-1].checkpoint.ckpt_step == 10
+        assert captured[-1].optimizer_config_override_provider.apply_lr_bounds is False
+        saved = json.loads((args.output / "run.json").read_text())
+        assert saved["optimizer_policy"] == "rwkv_lm_v2" and saved["learning_rate_scale"] == 0.5
+        args.fork_from, args.checkpoint_step, args.resume = None, None, args.output / "checkpoints"
+        train(args)
+        assert captured[-1].optimizer_config_override_provider.apply_lr_bounds is True
