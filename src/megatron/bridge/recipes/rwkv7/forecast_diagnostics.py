@@ -92,8 +92,7 @@ class ForecastDiagnosticsCallback(Callback):
         if context.state.tensorboard_logger is not None and context.state.train_state.step == 0:
             digest = hashlib.sha256()
             for name, parameter in sorted(model.named_parameters()):
-                canonical = name.replace(".parametrizations.weight.original", ".weight")
-                digest.update(canonical.encode())
+                digest.update(name.encode())
                 digest.update(parameter.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
             (self.output / "initialization.json").write_text(
                 json.dumps({"parameter_sha256": digest.hexdigest(), "step": 0}, indent=2) + "\n"
@@ -176,7 +175,8 @@ class ForecastDiagnosticsCallback(Callback):
         self.capture = False
         step = context.state.train_state.step + 1
         grad_norm = float(context.grad_norm)
-        loss = float(context.loss_dict["ohlcv huber"])
+        loss_name = "forecast pinball" if self.model.direct_quantile else "ohlcv huber"
+        loss = float(context.loss_dict[loss_name])
         grad_ratio = grad_norm / max(statistics.median(self.grad_history), 1e-30) if self.grad_history else 1.0
         loss_ratio = loss / max(statistics.median(self.loss_history), 1e-30) if self.loss_history else 1.0
         spike = len(self.grad_history) == 100 and (grad_ratio > 5 or loss_ratio > 1.2)

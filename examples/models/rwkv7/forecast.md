@@ -323,44 +323,6 @@ intermediate weight point to the original model dtype. BF16 endpoint
 interpolation synchronizes one-ULP changes at the midpoint and distorts the
 measured update path.
 
-### Paired training of centered ChannelMix
-
-`--center-channelmix` selects a forecast-only experimental variant corresponding
-to adaptive, per-token centering of squared-ReLU activations across neurons.
-Following [Rethinking Activation Functions: Reducing Bias Can Improve
-Learning](https://arxiv.org/html/2610.14500v1), evaluate this change by training
-both conditions from the same initialization and data order for the complete
-budget. The model's optimization landscape changes with the activation rule.
-
-For a bias-free down-projection, `W @ (h - mean(h))` equals
-`(W - rowmean(W)) @ h`. The variant uses PyTorch weight parametrization to
-compose this projection with the existing FlashRWKV2 ChannelMix operators.
-Centering arithmetic uses FP32 before rounding the effective weight to BF16;
-the activation edges and recurrent state precision retain their existing
-settings. Original parameters retain matrix weight decay, the native optimizer,
-and checkpoint handling. The variant flag is persisted in the HF configuration.
-
-Run the same complete training command twice with different output directories,
-adding `--center-channelmix` to the second condition. Keep the seed, epoch
-budget, data manifest, calibration, batch layout, optimizer parameters, scheduler,
-and validation windows identical. Use `--rwkv-optimizer` in both conditions for
-the RWKV-LM learning-rate groups, with `--learning-rate-scale 1`.
-`--diagnostics-interval 10` records initialization hashes and representation
-statistics alongside the raw loss and gradient history. The
-`initialization.json` hashes canonicalize parametrized weight names so both
-conditions can verify equality of their original parameter draws.
-
-Compare the complete trajectories and the original late interval through step
-3592, reporting raw-gradient median/P99/maximum, spike counts under the original
-thresholds, fixed-window overall and channel validation losses, and activation
-mean energy. Activation statistics include masked tail positions. The final
-overall validation-loss tolerance remains 1% relative to the paired baseline.
-
-Training validation now repeats a fixed, seeded selection of holdout windows
-at every evaluation. This separates model changes from changes in evaluation
-stocks and times. Evaluation still covers a subset; free-running metrics use
-the separate evaluator above.
-
 ## Validation commands
 
 ```bash
@@ -378,3 +340,77 @@ optimizer step, cached autoregression against full-context replay, repeatable
 state reset and exported-weight loading for prediction in a fresh process.
 Run the bounded native training/resume commands above to validate the complete
 distributed training lifecycle in the target runtime.
+
+## Direct multi-horizon close quantiles
+
+`--task direct_quantile --forecast-horizon 30` retains the historical OHLCV input
+and the original RWKV7/FlashRWKV2 computation. It projects the final historical
+hidden state to 30 future positions and nine quantiles (0.1 through 0.9).
+Independent windows reset recurrent state. Each label is
+`100 * log(future_close / last_context_close)`. Prices are recovered separately
+at each horizon as `last_context_close * exp(prediction / 100)`.
+
+The FP32 loss is standard pinball loss, averaged across quantiles and normalized
+across valid future positions using native Bridge DP/microbatch counts. Only
+complete context-plus-horizon windows enter this task. Use a fixed step budget;
+the next-bar epoch/tail semantics apply to the original task. Calibration uses
+training windows only, initializing each horizon/quantile bias from its empirical
+quantile and estimating historical input statistics separately.
+
+```bash
+timeout 8h uv run --no-sync python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  examples/models/rwkv7/forecast.py train \
+  --task direct_quantile --forecast-horizon 30 \
+  --config examples/models/rwkv7/forecast-l24-d256.json \
+  --data DATA/ashare-ohlcv --output runs/ashare-direct-quantile \
+  --context 64 --steps 3592 --warmup-steps 100 \
+  --global-batch-size 12288 --micro-batch-size 768 --learning-rate 1e-4 \
+  --save-interval 500 --eval-interval 500 --eval-iters 1 --seed 1234 \
+  --calibration-windows 4096 --head-gain 0.01 --head-fp32 --normalize-inputs \
+  --rwkv-optimizer --diagnostics-interval 10
+```
+
+`best-forecast.pt` stores the earliest checkpoint with the lowest fixed-window
+validation pinball loss; `best-validation.json` records its score and step.
+`forecast.pt` stores the last training weights. Native checkpoints retain the
+optimizer, scheduler, RNG and consumed-sample state for resume. New task settings
+and calibration statistics are persisted with the weights.
+
+Direct inference returns `[batch, horizon, quantile]` scaled cumulative returns.
+`predict_quantiles(..., fix_quantile_crossing=False)` returns raw outputs;
+the default sorts the quantile axis at each horizon. The `predict` CLI writes
+raw returns, sorted returns and price quantiles to CSV. Quantile ordering does
+not constrain the direction of prices over time.
+
+The direct evaluator writes `paths.npz`, `predictions.csv`, `windows.json`,
+metrics JSON, `fixed.png`, `error_percentiles.png` and `quality.png`. A frozen
+window file verifies instrument identity, context end and every future timestamp.
+Use the same window file and earlier prediction arrays to compare with the
+existing autoregressive baseline:
+
+```bash
+timeout 1h uv run --no-sync python examples/models/rwkv7/forecast.py evaluate \
+  --checkpoint runs/ashare-direct-quantile/best-forecast.pt \
+  --data DATA/ashare-ohlcv --split test --horizon 30 \
+  --windows PREVIOUS_EVALUATION/windows.json \
+  --baseline-paths PREVIOUS_EVALUATION/paths.npz \
+  --output runs/ashare-direct-quantile/evaluation/metrics.json
+```
+
+The report includes raw quantile crossing, raw/sorted pinball loss, calibration,
+60% and 80% coverage, width and interval score, price and return errors,
+stock/date groups and a symbol-block bootstrap against last-close persistence.
+An empirical training-quantile baseline reuses the calibration sample. Eight
+illustrative windows are selected by seed before inference; separate P10/P50/P90
+error examples explicitly describe their selection. Figures display actual
+historical/future close prices, the forecast origin, the median and marginal
+prediction intervals on actual timestamps.
+
+Reference revisions:
+
+- [Chronos-Bolt](https://github.com/amazon-science/chronos-forecasting/blob/1224fafa91e1ecd6674f5204066b159e40b5e4a1/src/chronos/chronos_bolt.py): direct horizon/quantile output.
+- [TFT](https://github.com/google-research/google-research/blob/0eebfd403ba438bfd14cb70b9b24a7745c997083/tft/libs/utils.py): standard pinball objective.
+- [TimesFM](https://github.com/google-research/timesfm/blob/e51928e27119cb17bebc005be2696b75e0a9e688/src/timesfm/configs.py): explicit quantile-crossing configuration.
+
+The implementation uses a linear RWKV readout and quantile-axis rearrangement;
+it retains this project's backbone, historical feature encoding and scaling.

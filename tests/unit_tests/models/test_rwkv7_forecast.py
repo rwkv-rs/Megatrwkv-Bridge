@@ -51,49 +51,6 @@ def test_config_checkpoint_and_parameter_contract(config):
         torch.testing.assert_close(value, model.state_dict()[name], rtol=0, atol=0)
 
 
-def test_centered_channelmix_algebra_and_gradients():
-    from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import _CenteredChannelMixWeight
-
-    weight = torch.randn(4, 16, requires_grad=True)
-    hidden = torch.randn(3, 16).relu().square().requires_grad_()
-    upstream = torch.randn(3, 4)
-    actual = F.linear(hidden, _CenteredChannelMixWeight()(weight))
-    expected = F.linear(hidden - hidden.mean(-1, keepdim=True), weight)
-    actual_grad = torch.autograd.grad(actual, (hidden, weight), upstream, retain_graph=True)
-    expected_grad = torch.autograd.grad(expected, (hidden, weight), upstream)
-    torch.testing.assert_close(actual, expected)
-    for a, b in zip(actual_grad, expected_grad):
-        torch.testing.assert_close(a, b)
-
-
-def test_centered_channelmix_bf16_matches_explicit_activation_centering():
-    from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import _CenteredChannelMixWeight
-
-    torch.manual_seed(2026)
-    weight = (torch.randn(256, 1024) * 0.02).bfloat16()
-    hidden = torch.randn(128, 1024).relu().square().bfloat16()
-    actual = F.linear(hidden, _CenteredChannelMixWeight()(weight)).float()
-    centered = (hidden.float() - hidden.float().mean(-1, keepdim=True)).bfloat16()
-    expected = F.linear(centered, weight).float()
-    assert F.cosine_similarity(actual.flatten(), expected.flatten(), dim=0) >= 0.99
-
-
-def test_centered_channelmix_preserves_shared_initialization_and_reload(config):
-    torch.manual_seed(2026)
-    baseline = RWKV7ForecastModel(config, None)
-    config.hf_config["forecast_center_channelmix"] = True
-    torch.manual_seed(2026)
-    centered = RWKV7ForecastModel(config, None)
-    baseline_parameters = dict(baseline.named_parameters())
-    for name, parameter in centered.named_parameters():
-        canonical = name.replace(".parametrizations.weight.original", ".weight")
-        torch.testing.assert_close(parameter, baseline_parameters[canonical], rtol=0, atol=0)
-    restored = RWKV7ForecastModel(config, None)
-    restored.load_state_dict(centered.state_dict(), strict=True)
-    for layer, other in zip(centered.hf.layers, restored.hf.layers):
-        torch.testing.assert_close(layer.mlp.value.weight, other.mlp.value.weight, rtol=0, atol=0)
-
-
 def test_task_head_preserves_alignment_and_gradients(config):
     model = RWKV7ForecastModel(config, None)
     features = torch.randn(2, 8, 5)
@@ -245,7 +202,6 @@ def test_channel_losses_use_identical_mask_and_valid_count():
         ("hf.layers.1.linear_attn.r_k", (1, 64), 0.0, 1.0),
         ("hf.layers.1.linear_attn.g_norm.weight", (64,), 0.0, 1.0),
         ("hf.layers.1.linear_attn.k_proj.weight", (64, 64), 1.0, 1.0),
-        ("hf.layers.1.mlp.value.parametrizations.weight.original", (64, 256), 1.0, 1.0),
         ("output_projection.weight", (5, 64), 1.0, 1.0),
         ("output_projection.bias", (5,), 0.0, 1.0),
     ],
@@ -404,7 +360,6 @@ def test_checkpoint_fork_preserves_source_and_resumes_corrected_groups(tmp_path,
         normalize_inputs=False,
         head_fp32=False,
         rwkv_optimizer=True,
-        center_channelmix=False,
         epochs=None,
         steps=20,
         eval_iters=0,
@@ -452,3 +407,75 @@ def test_checkpoint_fork_preserves_source_and_resumes_corrected_groups(tmp_path,
         args.fork_from, args.checkpoint_step, args.resume = None, None, args.output / "checkpoints"
         train(args)
         assert captured[-1].optimizer_config_override_provider.apply_lr_bounds is True
+
+
+def test_direct_quantile_head_loss_gradients_and_rearrangement(config):
+    config.hf_config.update(forecast_task="direct_quantile", forecast_horizon=3, forecast_quantiles=[0.1, 0.5, 0.9])
+    model = RWKV7ForecastModel(config, None)
+    features = torch.randn(2, 8, 5)
+    labels = torch.tensor([[0.1, 0.2, 0.3], [-0.1, -0.2, -0.3]])
+    with patch.object(
+        model.hf, "forward", side_effect=lambda **kw: SimpleNamespace(last_hidden_state=kw["inputs_embeds"])
+    ):
+        raw = model(features)
+        losses = model(features, labels, return_channel_losses=True)
+        error = labels.unsqueeze(-1) - raw
+        levels = torch.tensor([0.1, 0.5, 0.9])
+        torch.testing.assert_close(losses, torch.maximum(levels * error, (levels - 1) * error))
+        assert raw.shape == (2, 3, 3) and raw.dtype == torch.float32
+        loss, count, report = forecast_loss(
+            losses.mean(-1),
+            channel_losses=losses.detach(),
+            quantile_levels=(0.1, 0.5, 0.9),
+            check_for_nan_in_loss=False,
+            check_for_spiky_loss=False,
+        )
+        assert count == 6 and "forecast pinball" in report
+        (loss / count).backward()
+        assert model.input_projection.weight.grad.abs().sum() > 0
+        assert model.output_projection.weight.grad.abs().sum() > 0
+        torch.testing.assert_close(model.predict_quantiles(features), raw.sort(-1).values)
+        torch.testing.assert_close(model.predict_quantiles(features, fix_quantile_crossing=False), raw)
+    assert not any("parametrizations" in name for name, _ in model.named_parameters())
+    restored = RWKV7ForecastModel(RWKV7ForecastConfig.from_dict(config.as_dict()), None)
+    restored.load_state_dict(model.state_dict(), strict=True)
+
+
+def test_quantile_masked_microbatches_preserve_global_normalization():
+    prediction = torch.tensor([[1.0, 3.0], [5.0, 7.0]], requires_grad=True)
+    mask = torch.tensor([[1.0, 1.0], [1.0, 0.0]])
+    kwargs = dict(check_for_nan_in_loss=False, check_for_spiky_loss=False, quantile_levels=(0.5,))
+    total, count, _ = forecast_loss(
+        prediction, loss_mask=mask, channel_losses=prediction.detach().unsqueeze(-1), **kwargs
+    )
+    global_grad = torch.autograd.grad(total / count, prediction, retain_graph=True)[0]
+    parts = [
+        forecast_loss(
+            prediction[i : i + 1],
+            loss_mask=mask[i : i + 1],
+            channel_losses=prediction[i : i + 1].detach().unsqueeze(-1),
+            **kwargs,
+        )
+        for i in range(2)
+    ]
+    split_grad = torch.autograd.grad(sum(part[0] for part in parts) / sum(part[1] for part in parts), prediction)[0]
+    torch.testing.assert_close(global_grad, split_grad)
+    assert split_grad[1, 1] == 0
+
+
+def test_quantile_evaluation_proper_scores_and_price_units():
+    import numpy as np
+
+    entry = Path(__file__).resolve().parents[3] / "examples/models/rwkv7/forecast_quantile.py"
+    api = runpy.run_path(str(entry))
+    target = np.zeros((2, 3))
+    prediction = np.broadcast_to(np.array([-1.0, 0.0, 1.0]), (2, 3, 3))
+    scores = api["quantile_metrics"](target, prediction, np.array([0.1, 0.5, 0.9]))
+    assert scores["pinball_bps"] == pytest.approx(100 / 15)
+    assert scores["interval_80"]["coverage"] == 1
+    assert scores["interval_80"]["width_bps"] == 200
+    assert scores["interval_80"]["interval_score_bps"] == 200
+    actual = np.full((2, 3), 10.0)
+    result = api["point_metrics"](actual, actual + 0.1, np.array([10.0, 10.0]))
+    np.testing.assert_allclose(result["mae_cny_by_horizon"], 0.1)
+    np.testing.assert_allclose(result["mae_pct_by_horizon"], 1.0)

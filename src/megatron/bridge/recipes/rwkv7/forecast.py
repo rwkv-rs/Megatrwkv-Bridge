@@ -16,7 +16,7 @@ from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from transformers import RwkvConfig
 
 from megatron.bridge.data.base import DatasetBuildContext, DatasetProvider
-from megatron.bridge.data.datasets.ohlcv import OHLCVWindowDataset
+from megatron.bridge.data.datasets.ohlcv import OHLCVQuantileWindowDataset, OHLCVWindowDataset
 from megatron.bridge.models.conversion.utils import unwrap_model
 from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import RWKV7ForecastConfig
 from megatron.bridge.recipes.rwkv7.rwkv7 import rwkv7_pretrain_config
@@ -46,9 +46,7 @@ class RWKV7ForecastOptimizerOverrides(OptimizerConfigOverrideProvider):
         overrides = super().build_config_overrides(context) or {}
         no_decay = ParamWithNamePredicate(
             name="rwkv7_forecast_non_matrix_weight",
-            fn=lambda parameter, name: not (
-                name.endswith((".weight", ".parametrizations.weight.original")) and parameter.squeeze().ndim >= 2
-            ),
+            fn=lambda parameter, name: not (name.endswith(".weight") and parameter.squeeze().ndim >= 2),
         )
         overrides[ParamKey(with_name_predicate=no_decay)] = ParamGroupOverride(wd_mult=0.0)
         overrides[ParamKey(name="*.linear_attn.w0")] = ParamGroupOverride(lr_mult=2.0)
@@ -78,6 +76,8 @@ class ForecastRun(TypedDict):
     eval_iters: int
     seed: int
     world_size: int
+    forecast_references: NotRequired[dict[str, str]]
+    sample_budget: NotRequired[dict[str, int]]
 
 
 class ForecastCheckpoint(TypedDict):
@@ -99,19 +99,23 @@ class OHLCVDatasetConfig(DatasetProvider):
     dataloader_type: Literal["single"] = "single"
     epochs: int | None = None
     evaluation_samples: int | None = None
+    forecast_task: str = "next_bar"
+    forecast_horizon: int = 1
 
     def build_datasets(
         self, context: DatasetBuildContext
     ) -> tuple[OHLCVWindowDataset | None, OHLCVWindowDataset | None, OHLCVWindowDataset | None]:
         """Build requested splits with the sample lengths expected by Bridge."""
         datasets: list[OHLCVWindowDataset | None] = []
+        dataset_class = OHLCVQuantileWindowDataset if self.forecast_task == "direct_quantile" else OHLCVWindowDataset
         for split, count in zip(
             ("train", "validation", "test"),
             (context.train_samples, context.valid_samples, context.test_samples),
         ):
             datasets.append(
-                OHLCVWindowDataset(
+                dataset_class(
                     Path(self.root),
+                    horizon=self.forecast_horizon,
                     split=split,
                     seq_length=self.seq_length,
                     target_length=count,
@@ -157,6 +161,8 @@ def rwkv7_ohlcv_config(
         seq_length=hf_config.context_length,
         seed=seed,
         epochs=epochs,
+        forecast_task=getattr(hf_config, "forecast_task", "next_bar"),
+        forecast_horizon=getattr(hf_config, "forecast_horizon", 1),
         evaluation_samples=global_batch_size * eval_iters if eval_iters else None,
     )
     cfg.model.calculate_per_token_loss = True
@@ -186,14 +192,25 @@ def forecast_loss(
     check_for_spiky_loss: bool,
     loss_mask: torch.Tensor | None = None,
     channel_losses: torch.Tensor | None = None,
+    quantile_levels: tuple[float, ...] = (),
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Return summed per-bar loss and counts for native DP normalization."""
     mask = torch.ones_like(output) if loss_mask is None else loss_mask
     loss = (output.float() * mask).sum()
     validate_local_loss(loss, check_for_nan_in_loss=check_for_nan_in_loss, check_for_spiky_loss=check_for_spiky_loss)
     count = mask.sum().detach().to(torch.int)
-    report = {"ohlcv huber": torch.stack((loss.detach(), count.float()))}
-    if channel_losses is not None:
+    loss_name = "forecast pinball" if quantile_levels else "ohlcv huber"
+    report = {loss_name: torch.stack((loss.detach(), count.float()))}
+    if quantile_levels:
+        assert channel_losses is not None
+        for i, level in enumerate(quantile_levels):
+            report[f"forecast/q{level:.1f}"] = torch.stack(((channel_losses[..., i] * mask).sum(), count.float()))
+        for horizon in (1, 5, 15, 30):
+            if horizon <= output.shape[1]:
+                report[f"forecast/h{horizon}"] = torch.stack(
+                    ((output[:, horizon - 1] * mask[:, horizon - 1]).sum().detach(), mask[:, horizon - 1].sum())
+                )
+    elif channel_losses is not None:
         for i, name in enumerate(("open", "close", "upper_wick", "lower_wick", "volume")):
             report[f"ohlcv/{name}"] = torch.stack(((channel_losses[..., i] * mask).sum(), count.float()))
     return loss, count, report
@@ -213,6 +230,7 @@ def forecast_forward_step(
         check_for_spiky_loss=state.cfg.rerun_state_machine.check_for_spiky_loss,
         loss_mask=batch["loss_mask"].cuda(non_blocking=True),
         channel_losses=output.detach(),
+        quantile_levels=tuple(state.cfg.model.hf_config.get("forecast_quantiles", ())),
     )
 
 
@@ -243,6 +261,38 @@ class ForecastExportCallback(Callback):
 
     def __init__(self, output: Path, *, run: ForecastRun) -> None:
         self.output, self.run = output, run
+        self.best_loss = float("inf")
+        selection = output / "best-validation.json"
+        if selection.exists():
+            self.best_loss = json.loads(selection.read_text())["pinball"]
+
+    def on_eval_end(self, context: CallbackContext) -> None:
+        """Export the earliest minimum on the fixed validation windows."""
+        if self.run["hf_config"].get("forecast_task") != "direct_quantile":
+            return
+        assert context.total_loss_dict is not None
+        score = float(context.total_loss_dict["forecast pinball"])
+        record = {"step": context.state.train_state.step, "pinball": score}
+        if torch.distributed.get_rank() == 0:
+            with (self.output / "validation.jsonl").open("a") as stream:
+                stream.write(json.dumps(record) + "\n")
+        if score < self.best_loss:
+            self.best_loss = score
+            if torch.distributed.get_rank() == 0:
+                self._export(context, "best-forecast.pt")
+                (self.output / "best-validation.json").write_text(json.dumps(record, indent=2) + "\n")
+
+    def _export(self, context: CallbackContext, name: str) -> None:
+        model = unwrap_model(context.model)[0]
+        torch.save(
+            {
+                "version": 1,
+                "run": self.run,
+                "step": context.state.train_state.step,
+                "state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
+            },
+            self.output / name,
+        )
 
     def on_train_end(self, context: CallbackContext) -> None:
         """Save inference weights after the native training checkpoint lifecycle."""
@@ -274,13 +324,4 @@ class ForecastExportCallback(Callback):
             + "\n"
         )
         logger.info("Forecast peak memory across ranks (GiB): %s", peaks)
-        model = unwrap_model(context.model)[0]
-        torch.save(
-            {
-                "version": 1,
-                "run": self.run,
-                "step": context.state.train_state.step,
-                "state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
-            },
-            self.output / "forecast.pt",
-        )
+        self._export(context, "forecast.pt")

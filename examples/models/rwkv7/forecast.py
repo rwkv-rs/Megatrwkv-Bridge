@@ -44,7 +44,7 @@ def train(args: argparse.Namespace) -> None:
     """Train with Bridge's optimizer, scheduler, DDP and distributed checkpoints."""
     from transformers import RwkvConfig
 
-    from megatron.bridge.data.datasets.ohlcv import OHLCVWindowDataset, manifest_digest
+    from megatron.bridge.data.datasets.ohlcv import OHLCVQuantileWindowDataset, OHLCVWindowDataset, manifest_digest
     from megatron.bridge.recipes.rwkv7.forecast import (
         ForecastExportCallback,
         ForecastOptimizerCallback,
@@ -60,32 +60,46 @@ def train(args: argparse.Namespace) -> None:
     # Forecasting starts from scratch and discards the language embedding/head.
     hf.vocab_size = 1
     hf.tie_word_embeddings = False
+    direct = getattr(args, "task", "next_bar") == "direct_quantile"
+    dataset_class = OHLCVQuantileWindowDataset if direct else OHLCVWindowDataset
+    if direct:
+        hf.forecast_task = "direct_quantile"
+        hf.forecast_horizon = args.forecast_horizon
+        hf.forecast_quantiles = [i / 10 for i in range(1, 10)]
     if args.calibration_windows:
         import numpy as np
 
-        calibration = OHLCVWindowDataset(
+        calibration = dataset_class(
             args.data,
             split="train",
             seq_length=args.context,
-            stride=args.context,
-            keep_tail=True,
+            horizon=args.forecast_horizon if direct else 1,
+            stride=1 if direct else args.context,
+            keep_tail=not direct,
             seed=args.seed,
         )
         total, feature_total, feature_squares = (np.zeros(5, dtype=np.float64) for _ in range(3))
         count = 0
+        targets = []
         for i in range(args.calibration_windows):
             sample = calibration[i * calibration.num_windows // args.calibration_windows]
             mask = sample["loss_mask"].astype(bool)
-            total += sample["labels"][mask].sum(axis=0, dtype=np.float64)
+            if direct:
+                targets.append(sample["labels"])
+            else:
+                total += sample["labels"][mask].sum(axis=0, dtype=np.float64)
             if args.normalize_inputs:
-                features = sample["features"][mask].astype(np.float64)
+                features = (sample["features"] if direct else sample["features"][mask]).astype(np.float64)
                 feature_total += features.sum(axis=0)
                 feature_squares += np.square(features).sum(axis=0)
-            count += int(mask.sum())
+            count += len(sample["features"]) if direct else int(mask.sum())
         hf.forecast_initialization = "calibrated"
-        hf.forecast_target_mean = (total / count).tolist()
+        if direct:
+            hf.forecast_target_quantiles = np.quantile(targets, hf.forecast_quantiles, axis=0).T.tolist()
+        else:
+            hf.forecast_target_mean = (total / count).tolist()
         hf.forecast_head_gain = args.head_gain
-        logger.info("Training-only head calibration (%d bars): %s", count, hf.forecast_target_mean)
+        logger.info("Training-only head calibration: %d input bars", count)
         if args.normalize_inputs:
             mean = feature_total / count
             std = np.sqrt(np.maximum(feature_squares / count - mean**2, 0))
@@ -97,14 +111,13 @@ def train(args: argparse.Namespace) -> None:
         hf.forecast_head_fp32 = True
     if args.rwkv_optimizer:
         hf.forecast_optimizer = "rwkv_lm"
-    if args.center_channelmix:
-        hf.forecast_center_channelmix = True
     # Count actual windows before resolving an epoch-based optimizer-step budget.
     for split in ("train", "validation", "test") if args.eval_iters else ("train",):
-        dataset = OHLCVWindowDataset(
+        dataset = dataset_class(
             args.data,
             split=split,
             seq_length=args.context,
+            horizon=args.forecast_horizon if direct else 1,
             stride=args.context if args.epochs is not None else 1,
             keep_tail=args.epochs is not None,
         )
@@ -129,6 +142,18 @@ def train(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "world_size": int(os.environ.get("WORLD_SIZE", "1")),
     }
+    if direct:
+        samples = args.steps * args.global_batch_size
+        run["sample_budget"] = {
+            "windows": samples,
+            "history_bars": samples * args.context,
+            "future_positions": samples * args.forecast_horizon,
+        }
+        run["forecast_references"] = {
+            "chronos_bolt": "1224fafa91e1ecd6674f5204066b159e40b5e4a1",
+            "tft": "0eebfd403ba438bfd14cb70b9b24a7745c997083",
+            "timesfm": "e51928e27119cb17bebc005be2696b75e0a9e688",
+        }
     if args.learning_rate_scale != 1.0:
         run["learning_rate_scale"] = args.learning_rate_scale
     previous_run = json.loads((args.output / "run.json").read_text()) if args.resume else None
@@ -185,6 +210,7 @@ def train(args: argparse.Namespace) -> None:
     cfg.checkpoint.ckpt_step = args.checkpoint_step
     if load and args.rwkv_optimizer:
         loaded_run = source_run if args.fork_from else previous_run
+        assert loaded_run is not None
         # Legacy checkpoints stored lr_mult=2 but unscaled LR bounds. Construct
         # their exact group identities before restoring the corrected policy.
         cfg.optimizer_config_override_provider.apply_lr_bounds = loaded_run.get("optimizer_policy") == "rwkv_lm_v2"
@@ -239,6 +265,7 @@ def load_forecaster(checkpoint: Path) -> tuple[RWKV7ForecastModel, ForecastCheck
 
 def predict(args: argparse.Namespace) -> None:
     """Generate subsequent OHLCV bars from the end of one local instrument."""
+    import numpy as np
     import torch
 
     from megatron.bridge.data.datasets.ohlcv import (
@@ -257,6 +284,45 @@ def predict(args: argparse.Namespace) -> None:
         raise ValueError("Instrument must end with at least two valid contiguous minute bars.")
     context = min(trained_context, segments[-1][1] - segments[-1][0] - 1)
     features = torch.from_numpy(encode_bars(bars[-context - 1 :])).unsqueeze(0).cuda()
+    if model.direct_quantile:
+        if args.horizon > model.horizon:
+            raise ValueError("Requested horizon exceeds the trained direct forecast horizon.")
+        raw = model.predict_quantiles(features, fix_quantile_crossing=False)[0, : args.horizon].cpu().numpy()
+        ordered = np.sort(raw, axis=-1)
+        prices = bars[-1, 3] * np.exp(ordered.astype(np.float64) / 100)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with args.output.open("w", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(
+                (
+                    "exchange",
+                    "symbol",
+                    "context_end",
+                    "context_bars",
+                    "step",
+                    "quantile",
+                    "raw_return",
+                    "return",
+                    "close",
+                )
+            )
+            for h in range(args.horizon):
+                for q, level in enumerate(model.quantile_levels):
+                    writer.writerow(
+                        (
+                            exchange,
+                            symbol,
+                            str(timestamps[-1]),
+                            context,
+                            h + 1,
+                            level,
+                            raw[h, q],
+                            ordered[h, q],
+                            prices[h, q],
+                        )
+                    )
+        logger.info("Saved direct quantile forecast to %s", args.output)
+        return
     encoded = model.generate(features, horizon=args.horizon)[0].cpu().numpy()
     prediction = decode_bars(encoded, previous_close=float(bars[-1, 3]))
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -288,6 +354,11 @@ def evaluate(args: argparse.Namespace) -> None:
     )
 
     model, payload = load_forecaster(args.checkpoint)
+    if model.direct_quantile:
+        from forecast_quantile import evaluate_quantiles
+
+        evaluate_quantiles(args, model, payload)
+        return
     if manifest_digest(args.data) != payload["run"]["manifest_sha256"]:
         raise ValueError("Evaluation must use the training run's prepared dataset manifest.")
     context = payload["run"]["hf_config"]["context_length"]
@@ -391,9 +462,8 @@ def main() -> None:
     training.add_argument(
         "--rwkv-optimizer", action="store_true", help="Use RWKV-LM matrix-only decay and 2x w0 learning rate"
     )
-    training.add_argument(
-        "--center-channelmix", action="store_true", help="Train the mean-centered squared-ReLU ChannelMix variant"
-    )
+    training.add_argument("--task", choices=("next_bar", "direct_quantile"), default="next_bar")
+    training.add_argument("--forecast-horizon", type=int, default=30)
     training.add_argument("--diagnostics-interval", type=int, default=0, help="Module/activation metrics interval")
     training.add_argument(
         "--spike-snapshot", action="store_true", help="Save exact pre-update weights at the first detected spike"
@@ -412,9 +482,13 @@ def main() -> None:
     evaluation.add_argument("--split", choices=("validation", "test"), default="test")
     evaluation.add_argument("--horizon", type=int, required=True)
     evaluation.add_argument("--max-windows", type=int, default=1000)
+    evaluation.add_argument("--windows", type=Path, help="Frozen window identities from an earlier evaluation")
+    evaluation.add_argument("--baseline-paths", type=Path, help="Earlier autoregressive prediction NPZ")
     evaluation.set_defaults(handler=evaluate)
     args = parser.parse_args()
     if args.command == "train":
+        if args.task == "direct_quantile" and (args.epochs is not None or args.forecast_horizon <= 0):
+            parser.error("direct_quantile requires a positive --forecast-horizon and a --steps budget")
         if not math.isfinite(args.learning_rate_scale) or args.learning_rate_scale <= 0:
             parser.error("--learning-rate-scale must be positive and finite")
         if (args.checkpoint_step is not None) != (args.fork_from is not None):

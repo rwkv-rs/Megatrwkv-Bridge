@@ -401,3 +401,19 @@ class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):
 def manifest_digest(root: Path) -> str:
     """Fingerprint the prepared dataset selection and source revision."""
     return hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest()
+
+
+class OHLCVQuantileWindowDataset(OHLCVWindowDataset):
+    """Complete historical windows with future cumulative close-return labels."""
+
+    def __getitem__(self, index: int) -> dict[str, NDArray[np.float32]]:
+        """Return historical inputs and every future close relative to one anchor."""
+        _, start, arrays = self.window(index)
+        end = start + self.seq_length
+        anchor = arrays["close"][end - 1]
+        targets = PRICE_SCALE * np.log(arrays["close"][end : end + self.horizon] / anchor)
+        return {
+            "features": np.array(arrays["features"][start:end], dtype=np.float32),
+            "labels": targets.astype(np.float32),
+            "loss_mask": np.ones(self.horizon, dtype=np.float32),
+        }

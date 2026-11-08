@@ -225,3 +225,26 @@ def test_reject_unsorted_or_mixed_instrument_parquet(tmp_path):
     pq.write_table(pa.table(values), file)
     with pytest.raises(ValueError, match="one instrument"):
         load_instrument(file)
+
+
+def test_quantile_targets_share_one_anchor_and_stay_inside_split(prepared):
+    from megatron.bridge.data.datasets.ohlcv import OHLCVQuantileWindowDataset
+
+    _, root = prepared
+    for split in ("train", "validation", "test"):
+        dataset = OHLCVQuantileWindowDataset(root, split=split, seq_length=3, horizon=4)
+        assert dataset.num_windows == 2
+        for i in range(len(dataset)):
+            _, start, arrays = dataset.window(i)
+            sample = dataset[i]
+            assert sample["features"].shape == (3, 5)
+            assert sample["labels"].shape == sample["loss_mask"].shape == (4,)
+            expected = 100 * np.log(arrays["close"][start + 3 : start + 7] / arrays["close"][start + 2])
+            np.testing.assert_allclose(sample["labels"], expected, rtol=1e-6)
+            np.testing.assert_allclose(
+                arrays["close"][start + 2] * np.exp(sample["labels"].astype(float) / 100),
+                arrays["close"][start + 3 : start + 7],
+                rtol=1e-7,
+            )
+            assert sample["loss_mask"].sum() == 4
+            assert (np.diff(arrays["timestamps"][start : start + 7]) == np.timedelta64(1, "m")).all()

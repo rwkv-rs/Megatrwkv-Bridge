@@ -23,7 +23,7 @@ from megatron.bridge.recipes.rwkv7.forecast import rwkv7_ohlcv_config
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA and FlashRWKV2")
 
 
-@pytest.mark.parametrize("initialization", ["linear", "calibrated", "centered"])
+@pytest.mark.parametrize("initialization", ["linear", "calibrated"])
 def test_forecast_gradients_cached_rollout_and_fresh_process_reload(tmp_path, initialization):
     torch.manual_seed(2026)
     hf = RwkvConfig(hidden_size=64, num_hidden_layers=2, vocab_size=1, context_length=16)
@@ -34,8 +34,6 @@ def test_forecast_gradients_cached_rollout_and_fresh_process_reload(tmp_path, in
         hf.forecast_head_fp32 = True
         hf.forecast_input_mean = [0.0, 0.0, 0.03, 0.04, 0.85]
         hf.forecast_input_std = [0.1, 0.1, 0.05, 0.05, 0.3]
-    if initialization == "centered":
-        hf.forecast_center_channelmix = True
     config = rwkv7_ohlcv_config(
         hf,
         data=tmp_path,
@@ -148,3 +146,68 @@ def test_forecast_gradients_cached_rollout_and_fresh_process_reload(tmp_path, in
         opening, high, low, close, volume = (float(row[key]) for key in ("open", "high", "low", "close", "volume"))
         assert high >= max(opening, close) >= min(opening, close) >= low > 0
         assert volume >= 0
+
+
+def test_direct_quantile_backward_state_reset_and_fresh_reload(tmp_path):
+    """Exercise actual recurrent kernels and independently reload persisted weights."""
+    torch.manual_seed(2026)
+    hf = RwkvConfig(hidden_size=64, num_hidden_layers=2, vocab_size=1, context_length=16)
+    hf.forecast_task = "direct_quantile"
+    hf.forecast_horizon = 3
+    hf.forecast_quantiles = [0.1, 0.5, 0.9]
+    config = rwkv7_ohlcv_config(
+        hf,
+        data=tmp_path,
+        output=tmp_path,
+        steps=2,
+        micro_batch_size=1,
+        global_batch_size=1,
+        learning_rate=1e-3,
+        warmup_steps=0,
+        save_interval=1,
+        eval_interval=1,
+        eval_iters=0,
+        seed=2026,
+    ).model
+    model = RWKV7ForecastModel(config, None).cuda().train()
+    inputs = torch.randn(2, 16, 5, device="cuda") * 0.1
+    labels = torch.randn(2, 3, device="cuda") * 0.1
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    before = model.output_projection.weight.detach().clone()
+    loss = model(inputs, labels).mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    for prefix in ("hf.layers", "input_projection", "output_projection"):
+        gradients = [p.grad for n, p in model.named_parameters() if n.startswith(prefix) and p.grad is not None]
+        assert gradients and all(torch.isfinite(g).all() for g in gradients)
+        assert sum(g.float().abs().sum() for g in gradients) > 0
+    optimizer.step()
+    assert not torch.equal(before, model.output_projection.weight)
+    model.eval()
+    prediction = model.predict_quantiles(inputs)
+    model.predict_quantiles(torch.randn_like(inputs))
+    torch.testing.assert_close(model.predict_quantiles(inputs), prediction, atol=0, rtol=0)
+    payload = {
+        "version": 1,
+        "step": 1,
+        "run": {"hf_config": json.loads(hf.to_json_string())},
+        "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
+    }
+    torch.save(payload, tmp_path / "forecast.pt")
+    torch.save(inputs.cpu(), tmp_path / "inputs.pt")
+    script = (
+        "import runpy,sys,torch; from pathlib import Path; "
+        "entry=runpy.run_path('examples/models/rwkv7/forecast.py'); "
+        "root=Path(sys.argv[1]); model,_=entry['load_forecaster'](root/'forecast.pt'); "
+        "x=torch.load(root/'inputs.pt',weights_only=True).cuda(); "
+        "torch.save(model.predict_quantiles(x).cpu(),root/'predicted.pt')"
+    )
+    subprocess.run(
+        ["uv", "run", "--no-sync", "python", "-c", script, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[2],
+        check=True,
+        timeout=300,
+    )
+    torch.testing.assert_close(
+        torch.load(tmp_path / "predicted.pt", weights_only=True), prediction.cpu(), atol=0, rtol=0
+    )
