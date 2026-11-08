@@ -8,7 +8,7 @@ import logging
 from dataclasses import dataclass, fields
 from functools import partial
 from pathlib import Path
-from typing import Any, Iterator, Literal, TypedDict
+from typing import Any, Iterator, Literal, NotRequired, TypedDict
 
 import torch
 from megatron.core.optimizer import ParamKey, ParamWithNamePredicate
@@ -61,6 +61,7 @@ class ForecastRun(TypedDict):
     global_batch_size: int
     micro_batch_size: int
     learning_rate: float
+    learning_rate_scale: NotRequired[float]
     warmup_steps: int
     save_interval: int
     eval_interval: int
@@ -203,6 +204,23 @@ def forecast_forward_step(
         loss_mask=batch["loss_mask"].cuda(non_blocking=True),
         channel_losses=output.detach(),
     )
+
+
+class ForecastLearningRateCallback(Callback):
+    """Rescale the native scheduler after loading the original optimizer groups.
+
+    Core identifies checkpoint groups by their configured LR bounds. Keeping
+    those bounds preserves Adam/master state and the RWKV-LM 1x/2x grouping.
+    The native scheduler persists the multiplier and applies it on every step.
+    """
+
+    def __init__(self, scale: float) -> None:
+        self.scale = scale
+
+    def on_train_start(self, context: CallbackContext) -> None:
+        """Apply the requested multiplier at the restored sample cursor."""
+        context.scheduler.step_lr_rescale_schedule = ((0, self.scale),)
+        context.scheduler.step(0)
 
 
 class ForecastExportCallback(Callback):

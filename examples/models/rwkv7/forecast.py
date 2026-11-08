@@ -47,6 +47,7 @@ def train(args: argparse.Namespace) -> None:
     from megatron.bridge.data.datasets.ohlcv import OHLCVWindowDataset, manifest_digest
     from megatron.bridge.recipes.rwkv7.forecast import (
         ForecastExportCallback,
+        ForecastLearningRateCallback,
         ForecastRun,
         forecast_forward_step,
         rwkv7_ohlcv_config,
@@ -126,15 +127,17 @@ def train(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "world_size": int(os.environ.get("WORLD_SIZE", "1")),
     }
+    if args.learning_rate_scale != 1.0:
+        run["learning_rate_scale"] = args.learning_rate_scale
     load = args.fork_from / "checkpoints" if args.fork_from else args.resume
     if load and not checkpoint_exists(str(load)):
         raise FileNotFoundError(f"No native training checkpoint found in {load}.")
     if args.fork_from:
         source_run = json.loads((args.fork_from / "run.json").read_text())
-        changed = {key for key in run if source_run[key] != run[key]}
-        if changed - {"learning_rate"}:
+        changed = {key for key in run.keys() | source_run.keys() if source_run.get(key) != run.get(key)}
+        if changed - {"learning_rate_scale"}:
             raise ValueError(
-                f"Fork requires identical training semantics except learning_rate; changed: {sorted(changed)}"
+                f"Fork requires identical training semantics except learning_rate_scale; changed: {sorted(changed)}"
             )
     if int(os.environ.get("RANK", "0")) == 0:
         if args.resume:
@@ -152,7 +155,7 @@ def train(args: argparse.Namespace) -> None:
                             "source": str(args.fork_from.resolve()),
                             "checkpoint_step": args.checkpoint_step,
                             "source_run": source_run,
-                            "learning_rate": run["learning_rate"],
+                            "learning_rate_scale": args.learning_rate_scale,
                         },
                         indent=2,
                     )
@@ -182,6 +185,8 @@ def train(args: argparse.Namespace) -> None:
         cfg.scheduler.use_checkpoint_opt_param_scheduler = False
     cfg.train.exit_interval = args.exit_interval
     callbacks = [ForecastExportCallback(args.output, run=run)]
+    if args.learning_rate_scale != 1.0:
+        callbacks.append(ForecastLearningRateCallback(args.learning_rate_scale))
     if args.diagnostics_interval:
         from megatron.bridge.recipes.rwkv7.forecast_diagnostics import ForecastDiagnosticsCallback
 
@@ -348,6 +353,12 @@ def main() -> None:
     training.add_argument("--global-batch-size", type=int, default=32)
     training.add_argument("--micro-batch-size", type=int, default=4)
     training.add_argument("--learning-rate", type=float, default=3e-4)
+    training.add_argument(
+        "--learning-rate-scale",
+        type=float,
+        default=1.0,
+        help="Native scheduler multiplier preserving checkpoint groups and RWKV-LM LR ratios",
+    )
     training.add_argument("--warmup-steps", type=int, default=100)
     training.add_argument("--save-interval", type=int, default=1000)
     training.add_argument("--eval-interval", type=int, default=1000)
@@ -390,6 +401,8 @@ def main() -> None:
     evaluation.set_defaults(handler=evaluate)
     args = parser.parse_args()
     if args.command == "train":
+        if not math.isfinite(args.learning_rate_scale) or args.learning_rate_scale <= 0:
+            parser.error("--learning-rate-scale must be positive and finite")
         if (args.checkpoint_step is not None) != (args.fork_from is not None):
             parser.error("--fork-from and --checkpoint-step must be supplied together")
         if args.checkpoint_step is not None and args.checkpoint_step <= 0:

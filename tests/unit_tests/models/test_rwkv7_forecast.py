@@ -264,3 +264,56 @@ def test_replay_recurrent_state_orientation_and_token_order():
     torch.testing.assert_close(state[0, 0], final)
     output.float().sum().backward()
     torch.testing.assert_close(r.grad[0], torch.stack((initial.sum(-1), final.sum(-1))))
+
+
+def test_lr_rescale_preserves_rwkv_ratios_adam_state_and_scheduler_cursor():
+    from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+
+    from megatron.bridge.recipes.rwkv7.forecast import ForecastLearningRateCallback
+
+    parameters = [torch.nn.Parameter(torch.ones(2)) for _ in range(2)]
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": [parameter],
+                "max_lr": 1e-4 * multiplier,
+                "min_lr": 1e-5 * multiplier,
+                "lr_mult": multiplier,
+                "wd_mult": 0.0,
+            }
+            for parameter, multiplier in zip(parameters, (1.0, 2.0))
+        ]
+    )
+    for parameter in parameters:
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    moments = [optimizer.state[p]["exp_avg"].clone() for p in parameters]
+    scheduler = OptimizerParamScheduler(
+        optimizer,
+        init_lr=0,
+        max_lr=1e-4,
+        min_lr=1e-5,
+        lr_warmup_steps=100,
+        lr_decay_steps=3592,
+        lr_decay_style="cosine",
+        start_wd=0.033,
+        end_wd=0.033,
+        wd_incr_steps=3592,
+        wd_incr_style="constant",
+    )
+    scheduler.step(2500)
+    base_lr = optimizer.param_groups[0]["lr"]
+    ForecastLearningRateCallback(0.5).on_train_start(SimpleNamespace(scheduler=scheduler))
+    assert scheduler.num_steps == 2500
+    assert optimizer.param_groups[0]["lr"] == base_lr * 0.5
+    assert optimizer.param_groups[1]["lr"] == base_lr
+    assert optimizer.param_groups[0]["max_lr"] == 1e-4
+    for parameter, moment in zip(parameters, moments):
+        torch.testing.assert_close(optimizer.state[parameter]["exp_avg"], moment, rtol=0, atol=0)
+    saved = scheduler.state_dict()
+    scheduler.num_steps = 0
+    scheduler.load_state_dict(saved)
+    assert scheduler.num_steps == 2500
+    assert optimizer.param_groups[0]["lr"] == base_lr * 0.5
+    scheduler.step(1)
+    assert optimizer.param_groups[1]["lr"] == optimizer.param_groups[0]["lr"] * 2

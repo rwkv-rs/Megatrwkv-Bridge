@@ -30,6 +30,8 @@ def test_help_without_training_dependencies(monkeypatch, command):
         ["--exit-interval", "0"],
         ["--normalize-inputs"],
         ["--spike-snapshot"],
+        ["--learning-rate-scale", "0"],
+        ["--learning-rate-scale", "nan"],
         ["--fork-from", "previous-run"],
         ["--checkpoint-step", "2500"],
         ["--fork-from", "previous-run", "--checkpoint-step", "0"],

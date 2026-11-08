@@ -101,6 +101,7 @@ def main() -> None:
     parser.add_argument("--check-recurrent", action="store_true", help="Compare a captured sample's recurrent VJP")
     parser.add_argument("--batch-step", type=int, help="One-based data step; defaults to snapshot diagnostic step")
     args = parser.parse_args()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO)
     torch.set_num_threads(4)
     model, payload = load_forecaster(args.snapshot)
@@ -209,6 +210,7 @@ def main() -> None:
                     "sample_start": start,
                     "valid_key_norm": norm_summary(norms[valid]),
                     "padding_key_norm": norm_summary(norms[~valid]),
+                    "heads": [norm_summary(norms[..., head][valid]) for head in range(norms.shape[-1])],
                     "forward": [comparison(a, b) for a, b in zip(actual, reference)],
                     "backward": [comparison(a, b) for a, b in zip(actual_gradients, expected)],
                 }
@@ -234,6 +236,20 @@ def main() -> None:
                     "gradient_norm": amplification[b, t, h].item(),
                     "upstream_norm": upstream_direction.unflatten(-1, (-1, head_size))[b, t, h].norm().item(),
                 }
+                if offset == 0 and rank == 0:
+                    torch.save(
+                        {
+                            "run": run,
+                            "diagnostic_step": snapshot["diagnostic_step"],
+                            "layer": args.layer,
+                            "location": record["largest_direction_gradient"],
+                            "key_inputs": tuple((x[b : b + 1] if x.ndim == 3 else x).detach().cpu() for x in inputs),
+                            "key_upstream": tuple(g[b : b + 1].cpu() for g in gradients),
+                            "key_projection_input": captured["xk"][b : b + 1].cpu(),
+                            "key_projection_weight": attention.k_proj.weight.detach().cpu(),
+                        },
+                        args.output.with_suffix(".pt"),
+                    )
                 if args.check_recurrent and offset == 0 and rank == 0:
                     from flashrwkv2.tmix.wkv7.tilelang import tmix_wkv7_recurrent
 
@@ -256,6 +272,10 @@ def main() -> None:
                         "backward": [comparison(x, y) for x, y in zip(actual_grad, expected_grad)],
                         "state_absmax": expected_state.abs().max().item(),
                     }
+                    artifact = torch.load(args.output.with_suffix(".pt"), weights_only=True)
+                    artifact["recurrent_inputs"] = tuple(x.detach().cpu() for x in leaf)
+                    artifact["recurrent_upstream"] = dy.cpu()
+                    torch.save(artifact, args.output.with_suffix(".pt"))
                 records.append(record)
                 logger.info(
                     "rank=%s microbatch=%s %s", rank, record["microbatch"], record["largest_direction_gradient"]
@@ -268,6 +288,9 @@ def main() -> None:
     key_name = f"hf.layers.{args.layer}.linear_attn.k_proj.weight"
     report = {
         "snapshot_step": snapshot["diagnostic_step"],
+        "run": run,
+        "torch": torch.__version__,
+        "flashrwkv2": flashrwkv2.__version__,
         "consumed_samples": consumed,
         "reference_key": args.reference_key,
         "layer": args.layer,
@@ -281,7 +304,6 @@ def main() -> None:
         "branch_sum_vs_key_grad": comparison(branches[0] + branches[1], accumulated[key_name]),
         "microbatches": records,
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     logger.info("Saved %s; loss=%s grad_norm=%s", args.output, report["loss"], report["grad_norm"])
 
