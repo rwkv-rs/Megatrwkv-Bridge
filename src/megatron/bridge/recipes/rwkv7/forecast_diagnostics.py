@@ -174,6 +174,9 @@ class ForecastDiagnosticsCallback(Callback):
                         "diagnostic_step": step,
                         "consumed_samples_before_step": context.state.train_state.consumed_train_samples,
                         "state_dict": {name: value.cpu() for name, value in self.before_model.items()},
+                        "master_state_dict": {
+                            name: master.cpu() for (name, _, _), master in zip(self.parameters, self.before)
+                        },
                         "key_optimizer_before": {
                             name: {
                                 key: value.cpu() if isinstance(value, torch.Tensor) else value
@@ -201,6 +204,7 @@ class ForecastDiagnosticsCallback(Callback):
                 "diagnostic_step": step,
                 "consumed_samples_before_step": context.state.train_state.consumed_train_samples,
                 "state_dict": self.before_model.copy(),
+                "master_state_dict": {name: master for (name, _, _), master in zip(self.parameters, self.before)},
                 "key_optimizer_before": self.before_key_optimizer.copy(),
                 "key_optimizer_after": {
                     name: {"master": master.detach().clone(), "gradient": master.grad.detach().clone()}
