@@ -201,11 +201,16 @@ def main() -> None:
         implementation = (
             reference_readout if args.reference_readout and captured.get("active", False) else original_readout
         )
-        output = implementation(*inputs, **kwargs)
         if args.check_readout and captured.get("active", False):
-            captured["readout_inputs"] = inputs[:8]
+            branches = tuple(x.view_as(x) for x in inputs[:8])
+            output = implementation(*branches, *inputs[8:], **kwargs)
+            for branch in branches:
+                branch.retain_grad()
+            captured["readout_inputs"] = branches
             captured["readout_output"] = output
             output.retain_grad()
+        else:
+            output = implementation(*inputs, **kwargs)
         return output
 
     def layer_norm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, **kwargs: Any) -> torch.Tensor:
@@ -225,11 +230,16 @@ def main() -> None:
         return original_prepare(*inputs, **kwargs)
 
     def recurrent(*inputs: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        output: torch.Tensor = original_recurrent(*inputs, **kwargs)
         if args.check_recurrent and captured.get("active", False):
-            captured["recurrent_inputs"] = inputs
+            branches = tuple(x.view_as(x) for x in inputs)
+            output: torch.Tensor = original_recurrent(*branches, **kwargs)
+            for branch in branches:
+                branch.retain_grad()
+            captured["recurrent_inputs"] = branches
             captured["recurrent_output"] = output
             output.retain_grad()
+        else:
+            output = original_recurrent(*inputs, **kwargs)
         return output
 
     accumulated = {name: torch.zeros_like(p, dtype=torch.float32) for name, p in model.named_parameters()}
@@ -368,6 +378,11 @@ def main() -> None:
                         "final_state": comparison(final_state, expected_state),
                         "backward": [comparison(x, y) for x, y in zip(actual_grad, expected_grad)],
                         "state_absmax": expected_state.abs().max().item(),
+                        "captured_batch_output": comparison(captured["recurrent_output"][b : b + 1], expected_y),
+                        "captured_batch_backward": [
+                            comparison(x.grad[b : b + 1], g)
+                            for x, g in zip(captured["recurrent_inputs"], expected_grad)
+                        ],
                     }
                     artifact = torch.load(args.output.with_suffix(".pt"), weights_only=True)
                     artifact["recurrent_inputs"] = tuple(x.detach().cpu() for x in leaf)
@@ -394,6 +409,12 @@ def main() -> None:
                             )
                         },
                         "head_variance": [norm_summary(variance[..., h][valid]) for h in range(variance.shape[-1])],
+                        "captured_batch_backward": {
+                            name: comparison(x.grad, g)
+                            for name, x, g in zip(
+                                ("x", "r", "k", "v", "r_k", "weight", "bias", "gate"), readout_inputs, expected_grads
+                            )
+                        },
                         "head_vjp_gain": [norm_summary(gain[..., h][valid]) for h in range(variance.shape[-1])],
                     }
                     if offset == 0 and rank == 0:
@@ -420,6 +441,8 @@ def main() -> None:
                         expected_vjp = torch.autograd.grad(expected_norm, (leaf_x, leaf_w, leaf_b), upstream_norm)
                         actual_vjp = torch.autograd.grad(actual_norm, (leaf_x, leaf_w, leaf_b), upstream_norm)
                         norm_records[name] = {
+                            "input_grad_norm": norm_input.grad.float().norm().item(),
+                            "output_grad_norm": norm_output.grad.float().norm().item(),
                             "input_variance": norm_summary(variance[valid]),
                             "vjp_gain": norm_summary(norm_gain[valid]),
                             "largest_gain_location": {
@@ -429,6 +452,9 @@ def main() -> None:
                             },
                             "forward": comparison(actual_norm, expected_norm),
                             "backward": [comparison(a, b) for a, b in zip(actual_vjp, expected_vjp)],
+                            "captured_batch_backward": comparison(
+                                norm_input.grad[nb : nb + 1, nt : nt + 1], expected_vjp[0]
+                            ),
                         }
                     record["layer_norms"] = norm_records
                     norm_captures.clear()
