@@ -202,11 +202,17 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
     symbols = np.asarray([r["exchange"] + r["symbol"] for r in identities])
     dates = np.asarray([r["context_end"][:10] for r in identities])
     improvement = (np.abs(median - truth) - np.abs(persistence - truth)) / anchor[:, None] * 100
-    for name, keys in (("symbol", symbols), ("date", dates)):
+    for name, keys in (
+        ("symbol", symbols),
+        ("date", dates),
+        ("month", np.asarray([date[:7] for date in dates])),
+        ("origin_minute", np.asarray([r["context_end"][11:16] for r in identities])),
+    ):
         grouped[name] = {
             key: {
                 "windows": int((keys == key).sum()),
                 "point": point_metrics(truth[keys == key], median[keys == key], anchor[keys == key]),
+                "persistence_point": point_metrics(truth[keys == key], persistence[keys == key], anchor[keys == key]),
                 "probabilistic": quantile_metrics(target[keys == key], ordered[keys == key], levels),
             }
             for key in np.unique(keys)
@@ -220,6 +226,20 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
     differences = np.column_stack(
         (improvement.mean(-1), improvement[:, -1], pinball_difference.mean(-1), pinball_difference[:, -1])
     )
+    difference_columns = [
+        "median_minus_persistence_path_mae_pct",
+        "median_minus_persistence_h30_mae_pct",
+        "model_minus_empirical_path_pinball_bp",
+        "model_minus_empirical_h30_pinball_bp",
+    ]
+    for key, reference in probabilistic_baselines.items():
+        reference_error = target[..., None] - reference
+        reference_difference = (
+            np.maximum(levels * model_error, (levels - 1) * model_error)
+            - np.maximum(levels * reference_error, (levels - 1) * reference_error)
+        ).mean(-1) * 100
+        differences = np.column_stack((differences, reference_difference.mean(-1), reference_difference[:, -1]))
+        difference_columns.extend((f"model_minus_{key}_path_pinball_bp", f"model_minus_{key}_h30_pinball_bp"))
     confidence_by_group = {}
     for grouping, keys in (("symbol", symbols), ("date", dates)):
         _, inverse = np.unique(keys, return_inverse=True)
@@ -266,7 +286,8 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
             **{key: quantile_metrics(target, values, levels) for key, values in probabilistic_baselines.items()},
         },
         "mae_difference_vs_persistence_pct_bootstrap_95ci_path_and_h30": confidence[:, :2].tolist(),
-        "pinball_difference_vs_empirical_bps_bootstrap_95ci_path_and_h30": confidence[:, 2:].tolist(),
+        "pinball_difference_vs_empirical_bps_bootstrap_95ci_path_and_h30": confidence[:, 2:4].tolist(),
+        "bootstrap_difference_columns": difference_columns,
         "paired_difference_bootstrap_95ci_by_group": confidence_by_group,
         "grouped": grouped,
         "fixed_examples": fixed.tolist(),
@@ -388,18 +409,18 @@ def render_quantiles(
             points = [(px(float(t)), py(float(v))) for t, v in zip(xx, vv)]
             draw.line(points, fill=color, width=3)
         if origin is not None:
-            xx = px(origin)
+            origin_x = px(origin)
             for yy in range(top, bottom, 12):
-                draw.line((xx, yy, xx, yy + 6), fill="#475569", width=2)
+                draw.line((origin_x, yy, origin_x, yy + 6), fill="#475569", width=2)
         draw.line((left, top, left, bottom, right, bottom), fill="#94a3b8", width=2)
         for tick, label in tick_labels.items():
             if xmin <= tick <= xmax:
                 draw.text((px(tick) - 23, bottom + 9), label, fill="#475569", font=font)
         for j, (label, color, _, _) in enumerate(curves):
-            xx = left + (j % 3) * 205
+            legend_x = left + (j % 3) * 205
             yy = bottom + 32 + (j // 3) * 21
-            draw.line((xx, yy + 8, xx + 25, yy + 8), fill=color, width=3)
-            draw.text((xx + 30, yy), label, fill="#172b4d", font=font)
+            draw.line((legend_x, yy + 8, legend_x + 25, yy + 8), fill=color, width=3)
+            draw.text((legend_x + 30, yy), label, fill="#172b4d", font=font)
 
     for title, indices in (("fixed", report["fixed_examples"]), ("error_percentiles", ranked)):
         image = Image.new("RGB", (1800, 85 + 395 * len(indices)), "white")

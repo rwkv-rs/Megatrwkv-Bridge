@@ -41,7 +41,7 @@ def rolling_mean(values: NDArray[Any], starts: NDArray[Any], window: int) -> NDA
     right = np.arange(1, len(values) + 1)
     left = np.maximum(right - window, starts)
     prefix = np.concatenate(([0.0], np.cumsum(values, dtype=np.float64)))
-    return (prefix[right] - prefix[left]) / (right - left)
+    return np.asarray((prefix[right] - prefix[left]) / (right - left), dtype=np.float64)
 
 
 def forecast_covariates(
