@@ -126,8 +126,16 @@ def train(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "world_size": int(os.environ.get("WORLD_SIZE", "1")),
     }
-    if args.resume and not checkpoint_exists(str(args.resume)):
-        raise FileNotFoundError(f"No native training checkpoint found in {args.resume}.")
+    load = args.fork_from / "checkpoints" if args.fork_from else args.resume
+    if load and not checkpoint_exists(str(load)):
+        raise FileNotFoundError(f"No native training checkpoint found in {load}.")
+    if args.fork_from:
+        source_run = json.loads((args.fork_from / "run.json").read_text())
+        changed = {key for key in run if source_run[key] != run[key]}
+        if changed - {"learning_rate"}:
+            raise ValueError(
+                f"Fork requires identical training semantics except learning_rate; changed: {sorted(changed)}"
+            )
     if int(os.environ.get("RANK", "0")) == 0:
         if args.resume:
             if args.resume.resolve() != (args.output / "checkpoints").resolve():
@@ -137,6 +145,19 @@ def train(args: argparse.Namespace) -> None:
         else:
             args.output.mkdir(parents=True, exist_ok=False)
             (args.output / "run.json").write_text(json.dumps(run, indent=2) + "\n")
+            if args.fork_from:
+                (args.output / "fork.json").write_text(
+                    json.dumps(
+                        {
+                            "source": str(args.fork_from.resolve()),
+                            "checkpoint_step": args.checkpoint_step,
+                            "source_run": source_run,
+                            "learning_rate": run["learning_rate"],
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
     cfg = rwkv7_ohlcv_config(
         hf,
         data=args.data,
@@ -152,7 +173,13 @@ def train(args: argparse.Namespace) -> None:
         seed=args.seed,
         epochs=args.epochs,
     )
-    cfg.checkpoint.load = str(args.resume) if args.resume else None
+    cfg.checkpoint.load = str(load) if load else None
+    cfg.checkpoint.ckpt_step = args.checkpoint_step
+    if args.fork_from:
+        # Retain the loaded sample cursor and Adam state, but apply this run's LR
+        # endpoints at that same position on the original training schedule.
+        cfg.scheduler.override_opt_param_scheduler = True
+        cfg.scheduler.use_checkpoint_opt_param_scheduler = False
     cfg.train.exit_interval = args.exit_interval
     callbacks = [ForecastExportCallback(args.output, run=run)]
     if args.diagnostics_interval:
@@ -326,7 +353,10 @@ def main() -> None:
     training.add_argument("--eval-interval", type=int, default=1000)
     training.add_argument("--eval-iters", type=int, default=10)
     training.add_argument("--seed", type=int, default=1234)
-    training.add_argument("--resume", type=Path)
+    restore = training.add_mutually_exclusive_group()
+    restore.add_argument("--resume", type=Path)
+    restore.add_argument("--fork-from", type=Path, help="Source run for a separate optimizer-state continuation")
+    training.add_argument("--checkpoint-step", type=int, help="Native checkpoint iteration for --fork-from")
     training.add_argument("--exit-interval", type=int, help="Native bounded exit, retaining the full LR schedule")
     training.add_argument(
         "--calibration-windows", type=int, default=0, help="Training windows for head initialization"
@@ -360,6 +390,10 @@ def main() -> None:
     evaluation.set_defaults(handler=evaluate)
     args = parser.parse_args()
     if args.command == "train":
+        if (args.checkpoint_step is not None) != (args.fork_from is not None):
+            parser.error("--fork-from and --checkpoint-step must be supplied together")
+        if args.checkpoint_step is not None and args.checkpoint_step <= 0:
+            parser.error("--checkpoint-step must be positive")
         if args.normalize_inputs and not args.calibration_windows:
             parser.error("--normalize-inputs requires --calibration-windows > 0")
         if args.spike_snapshot and not args.diagnostics_interval:

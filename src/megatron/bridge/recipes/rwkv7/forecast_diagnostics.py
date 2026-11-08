@@ -92,6 +92,16 @@ class ForecastDiagnosticsCallback(Callback):
                 self.expected_squares.append(master.detach().square().mean())
                 self.state_owners.append(owners[id(master)])
         self.names = sorted(names)
+        if context.state.tensorboard_logger is not None:
+            records = []
+            for group in {id(group): group for _, _, group in self.parameters}.values():
+                records.append(
+                    {
+                        "parameters": [name for name, _, owner in self.parameters if owner is group],
+                        **{key: group[key] for key in ("lr", "weight_decay", "lr_mult", "wd_mult", "betas", "eps")},
+                    }
+                )
+            (self.output / "optimizer-groups.json").write_text(json.dumps(records, indent=2) + "\n")
         for name, module in model.named_modules():
             if name in {"input_projection", "output_projection", "hf.norm"} or (
                 name.startswith("hf.layers.") and (name.count(".") == 2 or name.endswith(("linear_attn", "mlp")))

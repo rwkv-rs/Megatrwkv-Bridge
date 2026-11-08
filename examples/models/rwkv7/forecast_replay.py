@@ -128,7 +128,8 @@ def main() -> None:
     head_size = model.hf.config.head_size
 
     def probe(key, scale, rate, rate_scale, size):
-        output = (reference_key if args.reference_key else original)(key, scale, rate, rate_scale, size)
+        implementation = reference_key if args.reference_key and captured.get("active", False) else original
+        output = implementation(key, scale, rate, rate_scale, size)
         if captured.get("active", False):
             captured["inputs"] = (key, scale, rate, rate_scale)
             captured["outputs"] = output
