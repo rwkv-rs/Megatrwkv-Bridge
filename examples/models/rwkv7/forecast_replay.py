@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import logging
 from pathlib import Path
@@ -127,13 +128,34 @@ def main() -> None:
     parser.add_argument("--check-norms", action="store_true", help="Trace all LayerNorm input/gradient scales")
     parser.add_argument("--microbatches", type=int, help="Bound the number of original rank microbatches replayed")
     parser.add_argument("--batch-step", type=int, help="One-based data step; defaults to snapshot diagnostic step")
+    parser.add_argument(
+        "--weights-from", type=Path, help="Use all or selected weights from another diagnostic snapshot"
+    )
+    parser.add_argument(
+        "--replace-parameter", action="append", help="Parameter glob to replace; repeat for multiple groups"
+    )
     args = parser.parse_args()
     if args.microbatches is not None and args.microbatches <= 0:
         parser.error("--microbatches must be positive")
+    if args.replace_parameter and args.weights_from is None:
+        parser.error("--replace-parameter requires --weights-from")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO)
     torch.set_num_threads(4)
     model, payload = load_forecaster(args.snapshot)
+    replaced = []
+    if args.weights_from is not None:
+        alternative = torch.load(args.weights_from, map_location="cpu", weights_only=True)
+        if alternative["run"]["hf_config"] != payload["run"]["hf_config"]:
+            raise ValueError("Replacement weights require the same model configuration.")
+        patterns = args.replace_parameter or ["*"]
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns):
+                    parameter.copy_(alternative["state_dict"][name])
+                    replaced.append(name)
+        if any(not any(fnmatch.fnmatchcase(name, pattern) for name in replaced) for pattern in patterns):
+            raise ValueError("Each replacement pattern must match a model parameter.")
     model.train()
     run = payload["run"]
     if manifest_digest(args.data) != run["manifest_sha256"]:
@@ -195,7 +217,7 @@ def main() -> None:
         for name, module in model.named_modules()
         if isinstance(module, torch.nn.LayerNorm)
     }
-    norm_captures: dict[str, tuple] = {}
+    norm_captures: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]] = {}
 
     def readout(*inputs: Any, **kwargs: Any) -> torch.Tensor:
         implementation = (
@@ -244,7 +266,8 @@ def main() -> None:
 
     accumulated = {name: torch.zeros_like(p, dtype=torch.float32) for name, p in model.named_parameters()}
     branches = [torch.zeros_like(attention.k_proj.weight, dtype=torch.float32) for _ in range(2)]
-    records, total_loss, total_count = [], 0.0, 0
+    records: list[dict[str, Any]] = []
+    total_loss, total_count = 0.0, 0
     micro = run["micro_batch_size"]
     world = run["world_size"]
     with (
@@ -392,7 +415,17 @@ def main() -> None:
                     readout_inputs = captured["readout_inputs"]
                     readout_upstream = captured["readout_output"].grad
                     readout_leaves = tuple(x.detach().requires_grad_() for x in readout_inputs)
-                    expected_readout = reference_readout(*readout_leaves, head_size=head_size)
+                    expected_readout = reference_readout(
+                        readout_leaves[0],
+                        readout_leaves[1],
+                        readout_leaves[2],
+                        readout_leaves[3],
+                        readout_leaves[4],
+                        readout_leaves[5],
+                        readout_leaves[6],
+                        readout_leaves[7],
+                        head_size=head_size,
+                    )
                     actual_readout = original_readout(*readout_leaves, head_size=head_size)
                     expected_grads = torch.autograd.grad(expected_readout, readout_leaves, readout_upstream)
                     actual_grads = torch.autograd.grad(actual_readout, readout_leaves, readout_upstream)
@@ -475,6 +508,8 @@ def main() -> None:
         "flashrwkv2": flashrwkv2.__version__,
         "consumed_samples": consumed,
         "reference_key": args.reference_key,
+        "weights_from": str(args.weights_from) if args.weights_from is not None else None,
+        "replaced_parameters": replaced,
         "layer": args.layer,
         "valid_count": total_count,
         "loss": total_loss / total_count,
