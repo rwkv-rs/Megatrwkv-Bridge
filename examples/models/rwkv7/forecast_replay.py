@@ -62,6 +62,32 @@ def norm_summary(values: torch.Tensor) -> dict[str, float | int]:
     }
 
 
+def reference_recurrent(
+    r: torch.Tensor,
+    w: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    head_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Differentiate the FP32 key-by-value recurrence with BF16 token output."""
+    rr, ww, kk, vv, aa, bb = [x.float().unflatten(-1, (-1, head_size)) for x in (r, w, k, v, a, b)]
+    state = rr.new_zeros((rr.shape[0], rr.shape[2], head_size, head_size))
+    outputs = []
+    for t in range(r.shape[1]):
+        decay = torch.exp(-0.6065306597126334 * torch.sigmoid(ww[:, t]))
+        sa = (state * aa[:, t, :, :, None]).sum(-2)
+        state = (
+            state * decay[..., None]
+            + bb[:, t, :, :, None] * sa[..., None, :]
+            + kk[:, t, :, :, None] * vv[:, t, :, None, :]
+        )
+        outputs.append((state * rr[:, t, :, :, None]).sum(-2).bfloat16())
+    return torch.stack(outputs, dim=1).flatten(-2), state
+
+
 def main() -> None:
     """Reconstruct native sampler order and compare key branches on one GPU."""
     from forecast import load_forecaster
@@ -72,6 +98,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=6, help="Zero-based layer index")
     parser.add_argument("--reference-key", action="store_true", help="Swap only key preparation for the reference")
+    parser.add_argument("--check-recurrent", action="store_true", help="Compare a captured sample's recurrent VJP")
     parser.add_argument("--batch-step", type=int, help="One-based data step; defaults to snapshot diagnostic step")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
@@ -122,11 +149,20 @@ def main() -> None:
     import flashrwkv2
 
     original_prepare = flashrwkv2.pretrain_tmix_wkv_prepare_bf16
+    original_recurrent = flashrwkv2.pretrain_tmix_wkv7_recurrent_bf16
 
     def prepare(*inputs, **kwargs):
         if captured.get("active", False):
             captured["xk"] = inputs[2].detach()
         return original_prepare(*inputs, **kwargs)
+
+    def recurrent(*inputs, **kwargs):
+        output = original_recurrent(*inputs, **kwargs)
+        if args.check_recurrent and captured.get("active", False):
+            captured["recurrent_inputs"] = inputs
+            captured["recurrent_output"] = output
+            output.retain_grad()
+        return output
 
     accumulated = {name: torch.zeros_like(p, dtype=torch.float32) for name, p in model.named_parameters()}
     branches = [torch.zeros_like(attention.k_proj.weight, dtype=torch.float32) for _ in range(2)]
@@ -136,6 +172,7 @@ def main() -> None:
     with (
         patch.object(prepare_module, "prepare_key", probe),
         patch.object(flashrwkv2, "pretrain_tmix_wkv_prepare_bf16", prepare),
+        patch.object(flashrwkv2, "pretrain_tmix_wkv7_recurrent_bf16", recurrent),
     ):
         for offset in range(0, run["global_batch_size"], micro * world):
             for rank in range(world):
@@ -196,6 +233,28 @@ def main() -> None:
                     "gradient_norm": amplification[b, t, h].item(),
                     "upstream_norm": upstream_direction.unflatten(-1, (-1, head_size))[b, t, h].norm().item(),
                 }
+                if args.check_recurrent and offset == 0 and rank == 0:
+                    from flashrwkv2.tmix.wkv7.tilelang import tmix_wkv7_recurrent
+
+                    leaf = tuple(
+                        x[b : b + 1].detach().contiguous().requires_grad_() for x in captured["recurrent_inputs"]
+                    )
+                    dy = captured["recurrent_output"].grad[b : b + 1].contiguous()
+                    expected_y, expected_state = reference_recurrent(*leaf, head_size=head_size)
+                    expected_grad = torch.autograd.grad(expected_y, leaf, dy)
+                    state = torch.zeros_like(expected_state)
+                    cu = torch.tensor([0, leaf[0].shape[1]], device=state.device, dtype=torch.int32)
+                    actual_y, final_state = tmix_wkv7_recurrent(
+                        *(x.view(-1, x.shape[-1] // head_size, head_size) for x in leaf), state, cu
+                    )
+                    actual_y = actual_y.view_as(expected_y)
+                    actual_grad = torch.autograd.grad(actual_y, leaf, dy)
+                    record["recurrent"] = {
+                        "output": comparison(actual_y, expected_y),
+                        "final_state": comparison(final_state, expected_state),
+                        "backward": [comparison(x, y) for x, y in zip(actual_grad, expected_grad)],
+                        "state_absmax": expected_state.abs().max().item(),
+                    }
                 records.append(record)
                 logger.info(
                     "rank=%s microbatch=%s %s", rank, record["microbatch"], record["largest_direction_gradient"]

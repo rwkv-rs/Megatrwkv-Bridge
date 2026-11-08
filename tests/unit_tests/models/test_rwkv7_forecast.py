@@ -1,5 +1,7 @@
 """Continuous task heads, state lifecycle, serialization and native loss counts."""
 
+import runpy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -223,3 +225,42 @@ def test_rwkv_optimizer_group_policy(name, shape, wd_mult, lr_mult):
     assert all(value.get("lr_mult", lr_mult) == lr_mult for value in matching)
     assert any(value.get("wd_mult") == 0.0 for value in matching) == (wd_mult == 0.0)
     assert any(value.get("lr_mult") == 2.0 for value in matching) == (lr_mult == 2.0)
+
+
+@pytest.mark.parametrize("magnitude", [1.0, 1e-8, 5e-13, 2e-12, 0.0])
+def test_replay_normalization_matches_piecewise_jacobian(magnitude):
+    entry = Path(__file__).resolve().parents[3] / "examples/models/rwkv7/forecast_replay.py"
+    reference = runpy.run_path(str(entry))["reference_key"]
+    key = torch.zeros(1, 1, 4, dtype=torch.bfloat16)
+    key[..., 0] = magnitude
+    key.requires_grad_()
+    scale = torch.ones(4, dtype=torch.bfloat16)
+    rate = torch.full_like(key, 0.5)
+    _, negative_direction, _ = reference(key, scale, rate, scale, 4)
+    # Tangential derivatives scale as 1/norm; the radial derivative vanishes
+    # above epsilon and becomes 1/epsilon inside the clamped region.
+    negative_direction.float().sum().backward()
+    norm = key.detach().float().norm().item()
+    expected = torch.full_like(key, -1 / max(norm, 1e-12))
+    if norm > 1e-12:
+        expected[..., 0] = 0
+    torch.testing.assert_close(key.grad, expected, rtol=0.01, atol=0)
+
+
+def test_replay_recurrent_state_orientation_and_token_order():
+    entry = Path(__file__).resolve().parents[3] / "examples/models/rwkv7/forecast_replay.py"
+    reference = runpy.run_path(str(entry))["reference_recurrent"]
+    r = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]], requires_grad=True)
+    w = torch.zeros_like(r)
+    k = torch.tensor([[[2.0, 3.0], [4.0, 5.0]]])
+    v = torch.tensor([[[5.0, 7.0], [11.0, 13.0]]])
+    zero = torch.zeros_like(r)
+    output, state = reference(r, w, k, v, zero, zero, head_size=2)
+    decay = torch.exp(torch.tensor(-0.6065306597126334 / 2))
+    initial = k[0, 0, :, None] * v[0, 0, None, :]
+    final = initial * decay + k[0, 1, :, None] * v[0, 1, None, :]
+    expected = torch.stack((r[0, 0] @ initial, r[0, 1] @ final)).bfloat16()[None]
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(state[0, 0], final)
+    output.float().sum().backward()
+    torch.testing.assert_close(r.grad[0], torch.stack((initial.sum(-1), final.sum(-1))))
