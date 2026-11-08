@@ -5,8 +5,8 @@ the generated bar back to predict subsequent bars. It uses transformers-rwkv's
 RWKV7 computation and FlashRWKV2 through Bridge's model builder, training loop,
 DDP, optimizer, scheduler and distributed checkpoints. It trains from random
 initialization, with task-specific continuous input and output projections.
-The recipe is **early, unoptimized**; throughput and forecast quality have not
-been measured.
+These are experimental forecasting tasks. Each run records its data identity,
+configuration, measured throughput and held-out forecast scores.
 
 ## Local data
 

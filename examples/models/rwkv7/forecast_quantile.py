@@ -144,14 +144,24 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
             }
             for key in np.unique(keys)
         }
+    model_error = target[..., None] - ordered
+    empirical_error = target[..., None] - empirical
+    pinball_difference = (
+        np.maximum(levels * model_error, (levels - 1) * model_error)
+        - np.maximum(levels * empirical_error, (levels - 1) * empirical_error)
+    ).mean(-1) * 100
+    differences = np.column_stack(
+        (improvement.mean(-1), improvement[:, -1], pinball_difference.mean(-1), pinball_difference[:, -1])
+    )
     # Resample symbols as blocks; all windows belonging to a sampled symbol stay together.
-    blocks = [improvement[symbols == key] for key in np.unique(symbols)]
+    blocks = [differences[symbols == key] for key in np.unique(symbols)]
     rng = np.random.default_rng(payload["run"]["seed"])
     boot = []
     for _ in range(1000):
         selected = rng.integers(len(blocks), size=len(blocks))
         errors = np.concatenate([blocks[i] for i in selected])
-        boot.append([errors.mean(), errors[:, -1].mean()])
+        boot.append(errors.mean(0))
+    confidence = np.quantile(boot, [0.025, 0.975], axis=0)
     with args.checkpoint.open("rb") as stream:
         checkpoint_digest = hashlib.file_digest(stream, "sha256").hexdigest()
     report = {
@@ -170,13 +180,16 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
         "raw_crossing_fraction": float((np.diff(raw_array, axis=-1) < 0).any(-1).mean()),
         "point": point,
         "probabilistic": {
-            "raw": quantile_metrics(target, raw_array, levels),
+            "raw": {
+                key: value
+                for key, value in quantile_metrics(target, raw_array, levels).items()
+                if not key.startswith("interval_")
+            },
             "sorted": quantile_metrics(target, ordered, levels),
             "empirical": quantile_metrics(target, empirical, levels),
         },
-        "mae_difference_vs_persistence_pct_bootstrap_95ci_path_and_h30": np.quantile(
-            boot, [0.025, 0.975], axis=0
-        ).tolist(),
+        "mae_difference_vs_persistence_pct_bootstrap_95ci_path_and_h30": confidence[:, :2].tolist(),
+        "pinball_difference_vs_empirical_bps_bootstrap_95ci_path_and_h30": confidence[:, 2:].tolist(),
         "grouped": grouped,
         "fixed_examples": fixed.tolist(),
     }
@@ -338,7 +351,7 @@ def render_quantiles(
                     (future_x, np.r_[anchors[i], prices[i, :, 0]], np.r_[anchors[i], prices[i, :, -1]], "#e1eff7"),
                     (future_x, np.r_[anchors[i], prices[i, :, 1]], np.r_[anchors[i], prices[i, :, -2]], "#b8dbea"),
                 ]
-                ticks = {int(j): str(times[i, j])[11:16] for j in np.linspace(begin, total - 1, 6, dtype=int)}
+                ticks = {float(j): str(times[i, j])[11:16] for j in np.linspace(begin, total - 1, 6, dtype=int)}
                 identity = identities[i]
                 label = f"{identity['exchange']} {identity['symbol']} | {identity['context_end'][:16]} | window {i}"
                 panel(
@@ -354,7 +367,7 @@ def render_quantiles(
         font=heading,
     )
     horizon = np.arange(1, actual.shape[1] + 1)
-    ticks = {int(j): str(j) for j in (1, 5, 15, 30) if j <= len(horizon)}
+    ticks = {float(j): str(j) for j in (1, 5, 15, 30) if j <= len(horizon)}
     curves = [
         (name, colors[i], horizon, np.asarray(result["mae_pct_by_horizon"]))
         for i, (name, result) in enumerate(report["point"].items())
