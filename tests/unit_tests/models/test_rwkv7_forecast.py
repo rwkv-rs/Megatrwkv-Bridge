@@ -66,6 +66,18 @@ def test_centered_channelmix_algebra_and_gradients():
         torch.testing.assert_close(a, b)
 
 
+def test_centered_channelmix_bf16_matches_explicit_activation_centering():
+    from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import _CenteredChannelMixWeight
+
+    torch.manual_seed(2026)
+    weight = (torch.randn(256, 1024) * 0.02).bfloat16()
+    hidden = torch.randn(128, 1024).relu().square().bfloat16()
+    actual = F.linear(hidden, _CenteredChannelMixWeight()(weight)).float()
+    centered = (hidden.float() - hidden.float().mean(-1, keepdim=True)).bfloat16()
+    expected = F.linear(centered, weight).float()
+    assert F.cosine_similarity(actual.flatten(), expected.flatten(), dim=0) >= 0.99
+
+
 def test_centered_channelmix_preserves_shared_initialization_and_reload(config):
     torch.manual_seed(2026)
     baseline = RWKV7ForecastModel(config, None)
