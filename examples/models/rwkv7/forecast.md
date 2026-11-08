@@ -323,6 +323,39 @@ intermediate weight point to the original model dtype. BF16 endpoint
 interpolation synchronizes one-ULP changes at the midpoint and distorts the
 measured update path.
 
+### Paired training of centered ChannelMix
+
+`--center-channelmix` selects a forecast-only experimental variant corresponding
+to adaptive, per-token centering of squared-ReLU activations across neurons.
+Following [Rethinking Activation Functions: Reducing Bias Can Improve
+Learning](https://arxiv.org/html/2610.14500v1), evaluate this change by training
+both conditions from the same initialization and data order for the complete
+budget. The model's optimization landscape changes with the activation rule.
+
+For a bias-free down-projection, `W @ (h - mean(h))` equals
+`(W - rowmean(W)) @ h`. The variant uses PyTorch weight parametrization to
+compose this projection with the existing FlashRWKV2 ChannelMix operators.
+Centering arithmetic uses FP32 before rounding the effective weight to BF16;
+the activation edges and recurrent state precision retain their existing
+settings. Original parameters retain matrix weight decay, the native optimizer,
+and checkpoint handling. The variant flag is persisted in the HF configuration.
+
+Run the same complete training command twice with different output directories,
+adding `--center-channelmix` to the second condition. Keep the seed, epoch
+budget, data manifest, calibration, batch layout, optimizer parameters, scheduler,
+and validation windows identical. Use `--rwkv-optimizer` in both conditions for
+the RWKV-LM learning-rate groups, with `--learning-rate-scale 1`.
+`--diagnostics-interval 10` records initialization hashes and representation
+statistics alongside the raw loss and gradient history. The
+`initialization.json` hashes canonicalize parametrized weight names so both
+conditions can verify equality of their original parameter draws.
+
+Compare the complete trajectories and the original late interval through step
+3592, reporting raw-gradient median/P99/maximum, spike counts under the original
+thresholds, fixed-window overall and channel validation losses, and activation
+mean energy. Activation statistics include masked tail positions. The final
+overall validation-loss tolerance remains 1% relative to the paired baseline.
+
 Training validation now repeats a fixed, seeded selection of holdout windows
 at every evaluation. This separates model changes from changes in evaluation
 stocks and times. Evaluation still covers a subset; free-running metrics use
