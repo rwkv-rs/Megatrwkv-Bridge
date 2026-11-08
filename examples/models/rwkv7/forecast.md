@@ -414,3 +414,57 @@ Reference revisions:
 
 The implementation uses a linear RWKV readout and quantile-axis rearrangement;
 it retains this project's backbone, historical feature encoding and scaling.
+
+
+### Recorded A-share experiment (2026-11-08)
+
+One run used the 24-layer, width-256 architecture above, seed 1234 and 3592
+optimizer steps. The fixed dataset manifest SHA256 was
+`9040ce2d9500c033b6ea5d6c20e48bbb75d3cb784e1bb92b0975c9d658ff6e4d`.
+Validation selected step 3592 with raw pinball loss 0.14478816. Evaluation reused
+1024 frozen windows from 1024 instruments across 365 dates, with forecast origins
+between 2025-01-02 and 2026-08-06. All forecasts used 64 observed bars to predict
+30 future positions. The earlier autoregressive model was reused.
+
+| Horizon (minutes) | Last-close MAE (%) | Earlier autoregressive MAE (%) | Direct median MAE (%) |
+|---|---:|---:|---:|
+| 1 | 0.11022 | 0.11172 | 0.10955 |
+| 5 | 0.19590 | 0.20190 | 0.19683 |
+| 15 | 0.32417 | 0.34831 | 0.32480 |
+| 30 | 0.45269 | 0.50576 | 0.45204 |
+
+MAE is normalized by each window's last observed close. The whole-path direct
+median MAE was 0.31327%, compared with 0.31337% for last-close persistence.
+The symbol-block bootstrap 95% confidence interval for the difference was
+[-0.00407, 0.00395] percentage points. At minute 30, direct median RMSE was
+0.80773%, versus 0.79122% for persistence. These point forecasts did not show a
+clear advantage over persistence.
+
+The mean sorted pinball loss was 12.40774 bp, versus 13.02918 bp for empirical
+training quantiles, a 4.77% improvement. The paired symbol-block bootstrap 95%
+confidence interval for that difference was [-0.79662, -0.46186] bp.
+
+| Nominal interval | Direct coverage | Empirical coverage | Direct width (bp) | Empirical width (bp) | Direct interval score (bp) | Empirical interval score (bp) |
+|---|---:|---:|---:|---:|---:|---:|
+| 60% | 61.40% | 62.88% | 61.87 | 59.81 | 113.97 | 122.87 |
+| 80% | 81.59% | 82.73% | 99.78 | 105.23 | 151.13 | 172.98 |
+
+These interval statistics average all 30 forecast positions; width and interval
+score use cumulative log-return bp. Raw outputs crossed in 10.27% of
+window/horizon pairs. Sorting produced ordered delivered intervals; raw pinball
+loss was 12.40869 bp.
+
+Training used eight RTX PRO 6000 Blackwell GPUs, global batch 12288, per-GPU
+microbatch 768 and two accumulation steps. Median steady-state iteration time
+was 1.3264 seconds, or 592907 historical bars/second, excluding the first 100
+steps. A 20-second sample measured mean GPU utilization between 94.35% and
+95.70% across cards. Peak allocated memory was 25.67 GiB/GPU. Training through
+final weight export took 81.99 minutes. No spike events were recorded under
+the existing rolling-100-step thresholds; maximum raw gradient norm was 0.05194
+and P99 was 0.04047.
+
+The experiment used PyTorch 2.14.0+cu130, transformers-rwkv 5.21.0.dev0,
+FlashRWKV2 0.1.0a18 and TileLang 0.1.15. The model implementation revision was
+`b83bc1963cdfe0697f9bc2f0279a837675c4cddb`. Exact configuration, dependency
+metadata, frozen windows, checkpoint SHA256, raw/sorted arrays, per-minute CSV,
+metrics and figures are preserved in the run artifacts.

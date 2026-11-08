@@ -291,12 +291,13 @@ def render_quantiles(
             return bottom - (v - low) / (high - low) * (bottom - top)
 
         draw.text((x + 15, y + 5), title, fill="#172b4d", font=font)
-        draw.text((x + 8, top), ylabel, fill="#172b4d", font=font)
+        draw.text((left, y + 27), ylabel, fill="#475569", font=font)
+        decimals = max(0, min(8, int(np.ceil(-np.log10((high - low) / 5))) + 1))
         for j in range(6):
             v = low + (high - low) * j / 5
             yy = py(v)
             draw.line((left, yy, right, yy), fill="#e2e8f0")
-            draw.text((x + 4, yy - 8), f"{v:.4g}", fill="#475569", font=font)
+            draw.text((x + 4, yy - 8), f"{v:.{decimals}f}", fill="#475569", font=font)
         if bands:
             for xx, lo, hi, color in bands:
                 polygon = [(px(float(t)), py(float(v))) for t, v in zip(xx, lo)]
