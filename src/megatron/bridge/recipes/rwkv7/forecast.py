@@ -64,6 +64,7 @@ class ForecastRun(TypedDict):
     hf_config: dict[str, Any]
     manifest_sha256: str
     steps: int
+    scheduler_decay_steps: NotRequired[int]
     epochs: int | None
     global_batch_size: int
     micro_batch_size: int

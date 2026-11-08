@@ -376,6 +376,19 @@ validation pinball loss; `best-validation.json` records its score and step.
 optimizer, scheduler, RNG and consumed-sample state for resume. New task settings
 and calibration statistics are persisted with the weights.
 
+To continue a direct quantile run for complete passes over its stride-1 training
+windows, replace `--steps` with `--additional-epochs 4`, supply
+`--fork-from SOURCE_RUN --checkpoint-step 3592`, and choose a new output directory.
+Keep the source model, calibration, data, batch and validation arguments identical.
+The final iteration is the loaded iteration plus
+`ceil(additional_epochs * training_windows / global_batch_size)`. The source
+learning-rate decay budget remains unchanged, so continuation after its decay
+endpoint uses the minimum learning rate without restarting warmup. Native Adam,
+RNG and consumed-sample state are restored. Earlier validation winners are copied
+into the new run and remain selected until a continuation checkpoint improves.
+Resume the continuation using its resolved `--steps` and `--resume`; the original
+decay budget is persisted in `run.json`.
+
 Direct inference returns `[batch, horizon, quantile]` scaled cumulative returns.
 `predict_quantiles(..., fix_quantile_crossing=False)` returns raw outputs;
 the default sorts the quantile axis at each horizon. The `predict` CLI writes

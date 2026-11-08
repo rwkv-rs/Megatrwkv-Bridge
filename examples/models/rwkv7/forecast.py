@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import shutil
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -57,6 +58,7 @@ def train(args: argparse.Namespace) -> None:
     from megatron.bridge.training.pretrain import pretrain
     from megatron.bridge.training.utils.checkpoint_utils import checkpoint_exists
 
+    additional_epochs = getattr(args, "additional_epochs", None)
     hf = RwkvConfig.from_json_file(args.config)
     hf.context_length = args.context
     # Forecasting starts from scratch and discards the language embedding/head.
@@ -136,6 +138,16 @@ def train(args: argparse.Namespace) -> None:
         if split == "train" and args.epochs is not None:
             args.steps = math.ceil(dataset.num_windows * args.epochs / args.global_batch_size)
             logger.info("%d epoch(s) resolve to %d optimizer steps", args.epochs, args.steps)
+        if split == "train" and additional_epochs is not None:
+            additional_steps = math.ceil(dataset.num_windows * additional_epochs / args.global_batch_size)
+            args.steps = args.checkpoint_step + additional_steps
+            logger.info(
+                "%d additional stride-1 epochs: %d windows, %d additional steps, final step %d",
+                additional_epochs,
+                dataset.num_windows,
+                additional_steps,
+                args.steps,
+            )
     if args.warmup_steps >= args.steps:
         raise ValueError("warmup_steps must be less than the resolved training steps.")
     run: ForecastRun = {
@@ -177,6 +189,8 @@ def train(args: argparse.Namespace) -> None:
     if args.learning_rate_scale != 1.0:
         run["learning_rate_scale"] = args.learning_rate_scale
     previous_run = json.loads((args.output / "run.json").read_text()) if args.resume else None
+    if previous_run is not None and "scheduler_decay_steps" in previous_run:
+        run["scheduler_decay_steps"] = previous_run["scheduler_decay_steps"]
     if args.rwkv_optimizer and (previous_run is None or "optimizer_policy" in previous_run):
         run["optimizer_policy"] = "rwkv_lm_v2"
     load = args.fork_from / "checkpoints" if args.fork_from else args.resume
@@ -184,8 +198,13 @@ def train(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"No native training checkpoint found in {load}.")
     if args.fork_from:
         source_run = json.loads((args.fork_from / "run.json").read_text())
+        if additional_epochs is not None:
+            run["scheduler_decay_steps"] = source_run.get("scheduler_decay_steps", source_run["steps"])
         changed = {key for key in run.keys() | source_run.keys() if source_run.get(key) != run.get(key)}
-        if changed - {"learning_rate_scale", "optimizer_policy"}:
+        allowed = {"learning_rate_scale", "optimizer_policy"}
+        if additional_epochs is not None:
+            allowed |= {"steps", "sample_budget", "scheduler_decay_steps"}
+        if changed - allowed:
             raise ValueError(
                 f"Fork requires identical training semantics except LR scale and optimizer policy; changed: {sorted(changed)}"
             )
@@ -212,11 +231,24 @@ def train(args: argparse.Namespace) -> None:
                             "checkpoint_step": args.checkpoint_step,
                             "source_run": source_run,
                             "learning_rate_scale": args.learning_rate_scale,
+                            "additional_epochs": additional_epochs,
                         },
                         indent=2,
                     )
                     + "\n"
                 )
+                if additional_epochs is not None:
+                    # Preserve the earlier validation winners across the entire
+                    # trajectory, even if every continuation checkpoint is worse.
+                    for name in (
+                        "best-validation.json",
+                        "best-median-validation.json",
+                        "best-forecast.pt",
+                        "best-median-forecast.pt",
+                    ):
+                        source = args.fork_from / name
+                        if source.exists():
+                            shutil.copy2(source, args.output / name)
     cfg = rwkv7_ohlcv_config(
         hf,
         data=args.data,
@@ -236,6 +268,7 @@ def train(args: argparse.Namespace) -> None:
     )
     cfg.checkpoint.load = str(load) if load else None
     cfg.checkpoint.ckpt_step = args.checkpoint_step
+    cfg.scheduler.lr_decay_iters = run.get("scheduler_decay_steps", args.steps)
     if load and args.rwkv_optimizer:
         loaded_run = source_run if args.fork_from else previous_run
         assert loaded_run is not None
@@ -460,6 +493,11 @@ def main() -> None:
     budget.add_argument(
         "--epochs", type=int, help="Complete passes with nonoverlapping targets, retaining tail windows"
     )
+    budget.add_argument(
+        "--additional-epochs",
+        type=int,
+        help="Additional complete stride-1 passes for direct_quantile with --fork-from; retain the source LR schedule",
+    )
     training.add_argument("--global-batch-size", type=int, default=32)
     training.add_argument("--micro-batch-size", type=int, default=4)
     training.add_argument("--learning-rate", type=float, default=3e-4)
@@ -551,6 +589,10 @@ def main() -> None:
         ):
             parser.error("Counts, window lengths and worker count must be positive")
     if args.command == "train":
+        if args.additional_epochs is not None and (
+            args.additional_epochs <= 0 or args.fork_from is None or args.task != "direct_quantile"
+        ):
+            parser.error("Positive --additional-epochs requires direct_quantile and --fork-from")
         if (args.covariates or args.validation_indices) and args.task != "direct_quantile":
             parser.error("Covariates and frozen validation indices require direct_quantile")
         if args.task == "direct_quantile" and (args.epochs is not None or args.forecast_horizon <= 0):
@@ -565,7 +607,7 @@ def main() -> None:
             parser.error("--normalize-inputs requires --calibration-windows > 0")
         if args.spike_snapshot and not args.diagnostics_interval:
             parser.error("--spike-snapshot requires --diagnostics-interval > 0")
-        if args.steps is None and args.epochs is None:
+        if args.steps is None and args.epochs is None and args.additional_epochs is None:
             args.steps = 10000
         if (
             any(

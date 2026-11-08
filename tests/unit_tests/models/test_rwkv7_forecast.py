@@ -346,13 +346,17 @@ def test_lr_rescale_preserves_rwkv_ratios_adam_state_and_scheduler_cursor(legacy
     assert optimizer.param_groups[1]["lr"] == optimizer.param_groups[0]["lr"] * 2
 
 
-def test_checkpoint_fork_preserves_source_and_resumes_corrected_groups(tmp_path, monkeypatch):
+@pytest.mark.parametrize("additional_epochs", [None, 4])
+def test_checkpoint_fork_preserves_source_and_resumes_corrected_groups(tmp_path, monkeypatch, additional_epochs):
     entry = Path(__file__).resolve().parents[3] / "examples/models/rwkv7/forecast.py"
     train = runpy.run_path(str(entry))["train"]
     architecture = tmp_path / "architecture.json"
     RwkvConfig(hidden_size=64, num_hidden_layers=2, context_length=16).to_json_file(architecture)
     args = SimpleNamespace(
         config=architecture,
+        task="direct_quantile" if additional_epochs else "next_bar",
+        forecast_horizon=30,
+        additional_epochs=None,
         covariates=None,
         validation_indices=None,
         data=tmp_path / "data",
@@ -385,6 +389,10 @@ def test_checkpoint_fork_preserves_source_and_resumes_corrected_groups(tmp_path,
     monkeypatch.setenv("RANK", "0")
     with (
         patch("megatron.bridge.data.datasets.ohlcv.OHLCVWindowDataset", return_value=SimpleNamespace(num_windows=20)),
+        patch(
+            "megatron.bridge.data.datasets.ohlcv.OHLCVQuantileWindowDataset",
+            return_value=SimpleNamespace(num_windows=20),
+        ),
         patch("megatron.bridge.data.datasets.ohlcv.manifest_digest", return_value="fixed-manifest"),
         patch("megatron.bridge.training.utils.checkpoint_utils.checkpoint_exists", return_value=True),
         patch(
@@ -397,8 +405,11 @@ def test_checkpoint_fork_preserves_source_and_resumes_corrected_groups(tmp_path,
         legacy.pop("optimizer_policy")
         original = json.dumps(legacy)
         (source / "run.json").write_text(original)
+        (source / "best-validation.json").write_text('{"step": 5, "pinball": 0.1}')
+        (source / "best-forecast.pt").write_bytes(b"existing validation winner")
         args.output = tmp_path / "continuation"
         args.fork_from, args.checkpoint_step, args.learning_rate_scale = source, 10, 0.5
+        args.additional_epochs = additional_epochs
         train(args)
         assert (source / "run.json").read_text() == original
         assert captured[-1].checkpoint.load == str(source / "checkpoints")
@@ -406,9 +417,20 @@ def test_checkpoint_fork_preserves_source_and_resumes_corrected_groups(tmp_path,
         assert captured[-1].optimizer_config_override_provider.apply_lr_bounds is False
         saved = json.loads((args.output / "run.json").read_text())
         assert saved["optimizer_policy"] == "rwkv_lm_v2" and saved["learning_rate_scale"] == 0.5
+        if additional_epochs:
+            assert saved["steps"] == 50  # 10 loaded steps + 4 * 20 windows / batch 2
+            assert saved["sample_budget"]["windows"] == 100
+            assert saved["scheduler_decay_steps"] == 20
+            assert captured[-1].train.train_iters == 50
+            assert captured[-1].scheduler.lr_decay_iters == 20
+            assert (args.output / "best-forecast.pt").read_bytes() == b"existing validation winner"
+            assert (args.output / "best-validation.json").read_text() == '{"step": 5, "pinball": 0.1}'
+        args.additional_epochs = None
         args.fork_from, args.checkpoint_step, args.resume = None, None, args.output / "checkpoints"
         train(args)
         assert captured[-1].optimizer_config_override_provider.apply_lr_bounds is True
+        if additional_epochs:
+            assert captured[-1].scheduler.lr_decay_iters == 20
 
 
 @pytest.mark.parametrize("input_size", [5, 23])
