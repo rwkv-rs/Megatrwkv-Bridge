@@ -292,6 +292,23 @@ def main() -> None:
                     "forward": [comparison(a, b) for a, b in zip(actual, reference)],
                     "backward": [comparison(a, b) for a, b in zip(actual_gradients, expected)],
                 }
+                projection_input = captured["xk"][valid].float()
+                mean_input = projection_input.mean(0)
+                covariance = (projection_input.T @ projection_input / projection_input.shape[0]).double().cpu()
+                eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0)
+                matrix_gradient = attention.k_proj.weight.grad.float().cpu()
+                singular_values = torch.linalg.svdvals(matrix_gradient)
+                mean_direction = F.normalize(mean_input.cpu(), dim=0)
+                record["projection_geometry"] = {
+                    "input_top1_energy": (eigenvalues[-1] / eigenvalues.sum()).item(),
+                    "input_top5_energy": (eigenvalues[-5:].sum() / eigenvalues.sum()).item(),
+                    "input_effective_rank": (eigenvalues.sum().square() / eigenvalues.square().sum()).item(),
+                    "input_mean_energy": (mean_input.square().sum().cpu() / covariance.trace()).item(),
+                    "gradient_top1_energy": (singular_values[0].square() / singular_values.square().sum()).item(),
+                    "gradient_mean_direction_energy": (
+                        (matrix_gradient @ mean_direction).square().sum() / matrix_gradient.square().sum()
+                    ).item(),
+                }
                 branch_keys = []
                 for branch in range(2):
                     leaf = tuple(tensor.detach().requires_grad_() for tensor in inputs)

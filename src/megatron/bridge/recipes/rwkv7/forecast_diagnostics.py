@@ -73,6 +73,7 @@ class ForecastDiagnosticsCallback(Callback):
         self.snapshot_written = False
         self.model: torch.nn.Module | None = None
         self.before_model: dict[str, torch.Tensor] = {}
+        self.before_key_optimizer: dict[str, Any] = {}
 
     def on_train_start(self, context: CallbackContext) -> None:
         """Resolve local optimizer shards and install observational forward hooks."""
@@ -140,6 +141,15 @@ class ForecastDiagnosticsCallback(Callback):
         self.hyperparameters = [(group["lr"], group["weight_decay"]) for _, _, group in self.parameters]
         if self.spike_snapshot and not self.snapshot_written:
             self.before_model = {name: p.detach().clone() for name, p in self.model.named_parameters()}
+            self.before_key_optimizer = {}
+            for i, ((name, master, group), owner) in enumerate(zip(self.parameters, self.state_owners)):
+                if name.endswith(".linear_attn.k_proj.weight") and "exp_avg" in owner.state[master]:
+                    self.before_key_optimizer[name] = {
+                        "master": self.before[i],
+                        "exp_avg": owner.state[master]["exp_avg"].detach().clone(),
+                        "exp_avg_sq": owner.state[master]["exp_avg_sq"].detach().clone(),
+                        **{key: group[key] for key in ("lr", "weight_decay", "betas", "eps", "step")},
+                    }
 
     @torch.no_grad()
     def on_train_step_end(self, context: CallbackContext) -> None:
@@ -161,11 +171,24 @@ class ForecastDiagnosticsCallback(Callback):
                         "diagnostic_step": step,
                         "consumed_samples_before_step": context.state.train_state.consumed_train_samples,
                         "state_dict": {name: value.cpu() for name, value in self.before_model.items()},
+                        "key_optimizer_before": {
+                            name: {
+                                key: value.cpu() if isinstance(value, torch.Tensor) else value
+                                for key, value in record.items()
+                            }
+                            for name, record in self.before_key_optimizer.items()
+                        },
+                        "key_optimizer_after": {
+                            name: {"master": master.detach().cpu(), "gradient": master.grad.detach().cpu()}
+                            for name, master, _ in self.parameters
+                            if name in self.before_key_optimizer
+                        },
                     },
                     self.output / "spike-before.pt",
                 )
             self.snapshot_written = True
         self.before_model.clear()
+        self.before_key_optimizer.clear()
         self.grad_history.append(grad_norm)
         self.loss_history.append(loss)
         if context.state.tensorboard_logger is not None:
