@@ -1,0 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Standalone Transformers export and inference for RWKV7 forecasting."""

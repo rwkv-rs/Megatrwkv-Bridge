@@ -1,0 +1,7 @@
+torch==2.14.0
+transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@f93dd4e01e0b565ef0390f76c6726d1d121ebbab
+flashrwkv2==0.1.0a18
+tilelang==0.1.15
+numpy>=1.26
+safetensors>=0.8.0
+huggingface-hub>=1.0
