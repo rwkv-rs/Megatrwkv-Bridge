@@ -4,6 +4,7 @@ language:
   - en
 license: apache-2.0
 library_name: transformers
+pipeline_tag: time-series-forecasting
 tags:
   - rwkv7
   - time-series
