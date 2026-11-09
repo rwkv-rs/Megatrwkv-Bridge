@@ -4,13 +4,14 @@
 """Standalone forecasting composition of the public transformers-rwkv backbone."""
 
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PreTrainedModel, RwkvConfig
 from transformers.models.rwkv.modeling_rwkv import RwkvModel
-from transformers.utils import ModelOutput
+from transformers.utils.generic import ModelOutput
 
 from .configuration_rwkv7_forecast import RWKV7ForecastConfig
 
@@ -25,7 +26,7 @@ class RWKV7ForecastOutput(ModelOutput):
     price_quantiles: torch.Tensor | None = None
 
 
-class RWKV7ForQuantileForecasting(PreTrainedModel):
+class RWKV7ForQuantileForecasting(PreTrainedModel):  # type: ignore[no-untyped-call]  # HF's subclass hook is untyped.
     """Forecast all horizons directly from a fresh RWKV7 history window.
 
     This model reuses transformers-rwkv and FlashRWKV2 without Megatron imports.
@@ -33,6 +34,9 @@ class RWKV7ForQuantileForecasting(PreTrainedModel):
     """
 
     config_class = RWKV7ForecastConfig
+    config: RWKV7ForecastConfig
+    feature_mean: torch.Tensor
+    feature_std: torch.Tensor
     base_model_prefix = "hf"
     main_input_name = "features"
     _no_split_modules = ["RwkvDecoderLayer"]
@@ -43,7 +47,7 @@ class RWKV7ForQuantileForecasting(PreTrainedModel):
         if getattr(backbone, "architecture_version", None) != "rwkv7":
             raise ValueError("Install the pinned transformers-rwkv dependency from requirements.txt.")
         self.hf = RwkvModel(backbone)
-        self.hf.embed_tokens = nn.Identity()
+        self.hf.set_input_embeddings(nn.Identity())  # type: ignore[no-untyped-call]  # Public HF setter is untyped.
         self.input_size = backbone.forecast_input_size
         self.horizon = backbone.forecast_horizon
         self.quantile_levels = tuple(backbone.forecast_quantiles)
@@ -52,7 +56,7 @@ class RWKV7ForQuantileForecasting(PreTrainedModel):
         # Native BF16 training rounded these constants before FP32 normalization.
         self.register_buffer("feature_mean", torch.tensor(backbone.forecast_input_mean, dtype=torch.bfloat16))
         self.register_buffer("feature_std", torch.tensor(backbone.forecast_input_std, dtype=torch.bfloat16))
-        self.post_init()
+        self.post_init()  # type: ignore[no-untyped-call]  # Public HF initialization hook is untyped.
 
     def forward(
         self,
@@ -99,4 +103,5 @@ class RWKV7ForQuantileForecasting(PreTrainedModel):
     @torch.inference_mode()
     def predict_quantiles(self, context: torch.Tensor, *, fix_quantile_crossing: bool = True) -> torch.Tensor:
         """Return FP32 cumulative-return quantiles from independent history."""
-        return self(context, fix_quantile_crossing=fix_quantile_crossing).quantiles
+        # Module.__call__ preserves hooks but is typed as Any by PyTorch.
+        return cast(torch.Tensor, self(context, fix_quantile_crossing=fix_quantile_crossing).quantiles)

@@ -8,7 +8,7 @@ from typing import Any
 from transformers import PreTrainedConfig
 
 
-class RWKV7ForecastConfig(PreTrainedConfig):
+class RWKV7ForecastConfig(PreTrainedConfig):  # type: ignore[no-untyped-call]  # HF's subclass hook is untyped.
     """Persist the complete RWKV backbone and forecasting feature contract."""
 
     model_type = "rwkv7_forecast"

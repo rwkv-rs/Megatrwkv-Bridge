@@ -33,9 +33,9 @@ def main() -> None:
     if backbone.get("forecast_task") != "direct_quantile":
         raise ValueError("Export requires a direct_quantile checkpoint.")
     args.output.mkdir(parents=True, exist_ok=False)
-    RWKV7ForecastConfig.register_for_auto_class("AutoConfig")
-    RWKV7ForQuantileForecasting.register_for_auto_class("AutoModel")
-    config = RWKV7ForecastConfig(backbone_config=backbone)
+    RWKV7ForecastConfig.register_for_auto_class("AutoConfig")  # type: ignore[no-untyped-call]  # HF registration hook.
+    RWKV7ForQuantileForecasting.register_for_auto_class("AutoModel")  # type: ignore[no-untyped-call]  # HF registration hook.
+    config = RWKV7ForecastConfig(backbone_config=backbone)  # type: ignore[call-arg]  # HF wraps the constructor signature.
     model = RWKV7ForQuantileForecasting(config).to(dtype=torch.bfloat16).eval()
     state = dict(payload["state_dict"])
     # Persist derived constants so Transformers' meta-device loading restores
