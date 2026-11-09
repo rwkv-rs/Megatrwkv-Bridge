@@ -50,12 +50,8 @@ class RWKV7ForQuantileForecasting(PreTrainedModel):
         self.input_projection = nn.Linear(self.input_size, backbone.hidden_size)
         self.output_projection = nn.Linear(backbone.hidden_size, self.horizon * len(self.quantile_levels))
         # Native BF16 training rounded these constants before FP32 normalization.
-        self.register_buffer(
-            "feature_mean", torch.tensor(backbone.forecast_input_mean, dtype=torch.bfloat16), persistent=False
-        )
-        self.register_buffer(
-            "feature_std", torch.tensor(backbone.forecast_input_std, dtype=torch.bfloat16), persistent=False
-        )
+        self.register_buffer("feature_mean", torch.tensor(backbone.forecast_input_mean, dtype=torch.bfloat16))
+        self.register_buffer("feature_std", torch.tensor(backbone.forecast_input_std, dtype=torch.bfloat16))
         self.post_init()
 
     def forward(

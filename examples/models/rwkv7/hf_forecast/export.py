@@ -37,9 +37,13 @@ def main() -> None:
     RWKV7ForQuantileForecasting.register_for_auto_class("AutoModel")
     config = RWKV7ForecastConfig(backbone_config=backbone)
     model = RWKV7ForQuantileForecasting(config).to(dtype=torch.bfloat16).eval()
-    model.load_state_dict(payload["state_dict"], strict=True)
+    state = dict(payload["state_dict"])
+    # Persist derived constants so Transformers' meta-device loading restores
+    # them just like parameters, rather than materializing uninitialized buffers.
+    state.update(feature_mean=model.feature_mean.clone(), feature_std=model.feature_std.clone())
+    model.load_state_dict(state, strict=True)
     for name, value in model.state_dict().items():
-        if value.dtype != payload["state_dict"][name].dtype or not torch.equal(value, payload["state_dict"][name]):
+        if value.dtype != state[name].dtype or not torch.equal(value, state[name]):
             raise AssertionError(f"Export changed tensor {name}")
     model.save_pretrained(args.output, safe_serialization=True)
     directory = Path(__file__).resolve().parent
@@ -53,6 +57,7 @@ def main() -> None:
         "source_checkpoint_sha256": hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
         "parameter_count": sum(t.numel() for t in model.parameters()),
         "tensor_count": len(model.state_dict()),
+        "source_tensor_count": len(payload["state_dict"]),
         "training_code_revision": "0fdda583a44ad54f823e0f1c872c94652ac36b25",
         "transformers_rwkv_revision": "f93dd4e01e0b565ef0390f76c6726d1d121ebbab",
         "data_manifest_sha256": payload["run"]["manifest_sha256"],
