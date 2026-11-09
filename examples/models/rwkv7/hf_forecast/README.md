@@ -167,7 +167,7 @@ predicted_close[h,q] = close[t] * exp(predicted_y[h,q] / 100)
 
 ## 文件与版本
 
-- `model.safetensors`：BF16 权重。
+- `model-*.safetensors` 与 `model.safetensors.index.json`：BF16 权重分片与索引。
 - `config.json`、`configuration_rwkv7_forecast.py`、`modeling_rwkv7_forecast.py`：标准 AutoClass 接口。
 - `processing_rwkv7_forecast.py`、`inference.py`：独立预处理与推理。
 - `example_bars.csv`、`example_inputs.npz`：同一个合成示例的两种输入格式。

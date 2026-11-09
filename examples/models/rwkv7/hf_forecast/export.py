@@ -45,7 +45,7 @@ def main() -> None:
     for name, value in model.state_dict().items():
         if value.dtype != state[name].dtype or not torch.equal(value, state[name]):
             raise AssertionError(f"Export changed tensor {name}")
-    model.save_pretrained(args.output, safe_serialization=True)
+    model.save_pretrained(args.output, safe_serialization=True, max_shard_size="8MB")
     directory = Path(__file__).resolve().parent
     for name in ("README.md", "requirements.txt", "inference.py", "processing_rwkv7_forecast.py"):
         shutil.copy2(directory / name, args.output / name)
