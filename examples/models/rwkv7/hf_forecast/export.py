@@ -35,8 +35,8 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=False)
     RWKV7ForecastConfig.register_for_auto_class("AutoConfig")  # type: ignore[no-untyped-call]  # HF registration hook.
     RWKV7ForQuantileForecasting.register_for_auto_class("AutoModel")  # type: ignore[no-untyped-call]  # HF registration hook.
-    config = RWKV7ForecastConfig(backbone_config=backbone)  # type: ignore[call-arg]  # HF wraps the constructor signature.
-    model = RWKV7ForQuantileForecasting(config).to(dtype=torch.bfloat16).eval()
+    config = RWKV7ForecastConfig(backbone_config=backbone)
+    model = RWKV7ForQuantileForecasting(config).to(dtype=torch.bfloat16).eval()  # type: ignore[call-arg]  # HF's constructor wrapper lacks a type-preserving signature.
     state = dict(payload["state_dict"])
     # Persist derived constants so Transformers' meta-device loading restores
     # them just like parameters, rather than materializing uninitialized buffers.
