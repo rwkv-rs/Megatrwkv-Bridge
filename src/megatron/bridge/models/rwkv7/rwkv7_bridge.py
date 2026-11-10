@@ -4,6 +4,7 @@
 """HF config and lossless replicated weight mapping for RWKV-7."""
 
 from collections.abc import Iterable
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -14,7 +15,7 @@ from transformers import PretrainedConfig
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
 from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
-from megatron.bridge.models.conversion.peft_bridge import AdapterWeightConversionTask
+from megatron.bridge.models.conversion.peft_bridge import AdapterWeight, AdapterWeightConversionTask
 from megatron.bridge.models.rwkv7.modeling_rwkv7 import RWKV7Model
 from megatron.bridge.models.rwkv7.rwkv7_config import RWKV7ModelConfig
 from megatron.bridge.models.transformer_config import TransformerConfig
@@ -28,6 +29,30 @@ class RWKV7Bridge(MegatronModelBridge):
     MODEL_CONFIG_CLASS = RWKV7ModelConfig
     USE_MODEL_CONFIG_FOR_CONVERSION = True
     ADDITIONAL_FILE_PATTERNS = ["*generation_config.json"]
+
+    def _get_lora_unwrapped_name(self, megatron_param: str) -> str:
+        return super()._get_lora_unwrapped_name(megatron_param).replace(".base_layer.", ".")
+
+    def _is_adapter_param_name(self, param_name: str) -> bool:
+        return param_name.endswith((".lora_A.default.weight", ".lora_B.default.weight"))
+
+    def _merge_lora_adapter_weights(
+        self,
+        megatron_model: list[RWKV7Model],
+        converted_weights_dict: dict[str, torch.Tensor],
+        adapter_weights: list[AdapterWeight],
+    ) -> dict[str, torch.Tensor]:
+        # Keep exported A unchanged; normalize only the NoRA merge computation.
+        models = unwrap_model(megatron_model)
+        weights = []
+        for adapter in adapter_weights:
+            module = models[adapter.linear_in_weight.vp_stage].get_submodule(adapter.global_base_prefix)
+            if module.use_nora["default"]:
+                a = adapter.linear_in_weight.weight.float()
+                a = a / (a.norm(dim=0, keepdim=True) + 1e-6)
+                adapter = replace(adapter, linear_in_weight=adapter.linear_in_weight._replace(weight=a))
+            weights.append(adapter)
+        return super()._merge_lora_adapter_weights(megatron_model, converted_weights_dict, weights)
 
     def build_adapter_conversion_tasks(
         self,

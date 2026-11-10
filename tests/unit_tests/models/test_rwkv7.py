@@ -188,6 +188,52 @@ def test_native_adapter_export(hf_config, tmp_path, use_nora):
     torch.testing.assert_close(before(x), after(x), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("use_nora", [False, True])
+def test_native_merged_export(hf_config, use_nora):
+    from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+
+    bridge = AutoBridge.from_hf_config(hf_config)
+    model = RWKV7Model(bridge.get_model_config(), Mock())
+    RWKV7LoRA(dim=4, alpha=8, use_nora=use_nora)(model)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if ".lora_B." in name:
+                parameter.normal_(std=0.1)
+    family = bridge._model_bridge
+    tasks = []
+    expected = {}
+    registry = family.mapping_registry()
+    for name, parameter in model.named_parameters():
+        if family._is_adapter_param_name(name):
+            continue
+        mapping = registry.megatron_to_hf_lookup(family._get_lora_unwrapped_name(name))
+        module = model.get_submodule(name.rsplit(".", 1)[0])
+        tasks.append(
+            WeightConversionTask(
+                param_name=name,
+                global_param_name=name,
+                mapping=mapping,
+                pp_rank=0,
+                vp_stage=0,
+                megatron_module=module,
+                param_weight=parameter,
+            )
+        )
+        value = parameter.detach().clone()
+        if ".base_layer." in name:
+            adapter = model.get_submodule(name.removesuffix(".base_layer.weight"))
+            a = adapter.lora_A["default"].weight.float()
+            if use_nora:
+                a = a / (a.norm(dim=0, keepdim=True) + 1e-6)
+            value = (value.float() + 2 * adapter.lora_B["default"].weight.float() @ a).to(value.dtype)
+        expected[mapping.hf_param] = value
+    exported = list(bridge.export_hf_weights([model], conversion_tasks=tasks, show_progress=False, cpu=True))
+    assert {item.param_name for item in exported} == expected.keys()
+    for item in exported:
+        torch.testing.assert_close(item.weight, expected[item.param_name], rtol=0, atol=0)
+    assert len([name for name, _ in model.named_parameters() if family._is_adapter_param_name(name)]) == 24
+
+
 @pytest.mark.parametrize("mode", ["scratch", "full", "fsdp", "lora", "nora"])
 @pytest.mark.parametrize("export", [False, True])
 @pytest.mark.parametrize("profile", ["generic", "pro6000x8"])
