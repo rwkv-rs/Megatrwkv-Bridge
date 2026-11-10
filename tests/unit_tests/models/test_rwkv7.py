@@ -3,6 +3,7 @@
 
 """RWKV-7 construction, loss alignment, conversion and LoRA contracts."""
 
+import json
 import runpy
 import sys
 from pathlib import Path
@@ -128,6 +129,63 @@ def test_lora_fused_spec_and_checkpoint(hf_config, use_nora):
     model.merge_lora()
     assert all("lora_" not in name for name, _ in model.named_parameters())
     torch.testing.assert_close(model.hf.model.layers[0].linear_attn.r_proj(x), output, rtol=0.05, atol=0.05)
+
+
+@pytest.mark.parametrize("use_nora", [False, True])
+def test_native_adapter_export(hf_config, tmp_path, use_nora):
+    from safetensors.torch import load_file
+
+    bridge = AutoBridge.from_hf_config(hf_config)
+    model = RWKV7Model(bridge.get_model_config(), Mock())
+    peft = RWKV7LoRA(dim=4, alpha=8, use_nora=use_nora)
+    peft(model)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if ".lora_B." in name:
+                parameter.normal_(std=0.1)
+    expected = {
+        name.removeprefix("hf.").replace(".default.", "."): parameter
+        for name, parameter in model.named_parameters()
+        if ".lora_A." in name or ".lora_B." in name
+    }
+    assert len(expected) == 24
+    exported = list(bridge.export_adapter_weights([model], show_progress=False, with_megatron_names=True))
+    bridge.save_hf_adapter([model], tmp_path, peft, show_progress=False, base_model_name_or_path="rwkv7-base")
+    excluded = list(
+        bridge.export_adapter_weights(
+            [model], show_progress=False, exclude_adapter_base_prefixes=["hf.model.layers.0."]
+        )
+    )
+    assert {item.param_name for item in exported} == expected.keys()
+    for item in exported:
+        assert item.megatron_param_names == ("hf." + item.param_name.replace(".weight", ".default.weight"),)
+        torch.testing.assert_close(item.weight, expected[item.param_name], rtol=0, atol=0)
+    assert len(excluded) == 12
+    assert all("layers.1." in item.param_name for item in excluded)
+    saved = load_file(tmp_path / "adapter_model.safetensors")
+    assert saved.keys() == {"base_model.model." + name for name in expected}
+    for name, parameter in expected.items():
+        torch.testing.assert_close(saved["base_model.model." + name], parameter, rtol=0, atol=0)
+    config = json.loads((tmp_path / "adapter_config.json").read_text())
+    assert config["r"] == 4 and config["lora_alpha"] == 8
+    assert config["use_nora"] is use_nora
+    assert config["base_model_name_or_path"] == "rwkv7-base"
+    assert config["target_modules"] == sorted(peft.target_modules)
+    assert config["rank_pattern"] == {} and config["alpha_pattern"] == {}
+    assert config["lora_dropout"] == 0.0
+
+    restored = RWKV7Model(bridge.get_model_config(), Mock())
+    peft(restored)
+    missing, unexpected = restored.hf.load_state_dict(
+        {name.removeprefix("base_model.model.").replace(".weight", ".default.weight"): p for name, p in saved.items()},
+        strict=False,
+    )
+    assert not unexpected and all("lora_" not in name for name in missing)
+    x = torch.randn(2, 64, dtype=torch.bfloat16)
+    before = model.hf.model.layers[0].linear_attn.r_proj
+    after = restored.hf.model.layers[0].linear_attn.r_proj
+    after.base_layer.load_state_dict(before.base_layer.state_dict())
+    torch.testing.assert_close(before(x), after(x), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("mode", ["scratch", "full", "fsdp", "lora", "nora"])

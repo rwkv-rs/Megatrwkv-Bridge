@@ -2017,4 +2017,6 @@ def build_adapter_config_dict(
     }
     if target_parameters:
         config["target_parameters"] = target_parameters
+    if hasattr(peft_config, "use_nora"):
+        config["use_nora"] = peft_config.use_nora
     return config
