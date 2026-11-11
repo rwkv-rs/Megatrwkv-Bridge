@@ -151,26 +151,19 @@ def test_native_adapter_export(hf_config, tmp_path, use_nora):
     assert len(expected) == 24
     exported = list(bridge.export_adapter_weights([model], show_progress=False, with_megatron_names=True))
     bridge.save_hf_adapter([model], tmp_path, peft, show_progress=False, base_model_name_or_path="rwkv7-base")
-    excluded = list(
-        bridge.export_adapter_weights(
-            [model], show_progress=False, exclude_adapter_base_prefixes=["hf.model.layers.0."]
-        )
-    )
     assert {item.param_name for item in exported} == expected.keys()
     for item in exported:
         assert item.megatron_param_names == ("hf." + item.param_name.replace(".weight", ".default.weight"),)
         torch.testing.assert_close(item.weight, expected[item.param_name], rtol=0, atol=0)
-    assert len(excluded) == 12
-    assert all("layers.1." in item.param_name for item in excluded)
     saved = load_file(tmp_path / "adapter_model.safetensors")
     assert saved.keys() == {"base_model.model." + name for name in expected}
     for name, parameter in expected.items():
         torch.testing.assert_close(saved["base_model.model." + name], parameter, rtol=0, atol=0)
     config = json.loads((tmp_path / "adapter_config.json").read_text())
     assert config["r"] == 4 and config["lora_alpha"] == 8
-    assert config["use_nora"] is use_nora
+    assert config.get("use_nora") is (True if use_nora else None)
     assert config["base_model_name_or_path"] == "rwkv7-base"
-    assert config["target_modules"] == sorted(peft.target_modules)
+    assert config["target_modules"] == sorted({name.rsplit(".", 2)[0] for name in expected})
     assert config["rank_pattern"] == {} and config["alpha_pattern"] == {}
     assert config["lora_dropout"] == 0.0
 
@@ -188,50 +181,78 @@ def test_native_adapter_export(hf_config, tmp_path, use_nora):
     torch.testing.assert_close(before(x), after(x), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("use_nora", [False, True])
-def test_native_merged_export(hf_config, use_nora):
-    from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+def test_native_adapter_export_excluded_layers(hf_config, tmp_path):
+    from peft import PeftModel
+    from transformers import RwkvForCausalLM
 
     bridge = AutoBridge.from_hf_config(hf_config)
     model = RWKV7Model(bridge.get_model_config(), Mock())
+    base = RwkvForCausalLM(hf_config).to(dtype=torch.bfloat16)
+    base.load_state_dict(model.hf.state_dict())
+    peft = RWKV7LoRA(dim=4, alpha=8)
+    peft(model)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if ".lora_B." in name:
+                parameter.normal_(std=0.1)
+    bridge.save_hf_adapter(
+        [model], tmp_path, peft, show_progress=False, exclude_adapter_base_prefixes=["hf.model.layers.0."]
+    )
+
+    restored = PeftModel.from_pretrained(base, tmp_path, is_trainable=True, autocast_adapter_dtype=False)
+    restored_base = restored.get_base_model()
+    trainable = {name for name, parameter in restored_base.named_parameters() if parameter.requires_grad}
+    expected = {
+        name: parameter
+        for name, parameter in model.hf.named_parameters()
+        if name.startswith("model.layers.1.") and parameter.requires_grad
+    }
+    assert len(expected) == 12
+    assert trainable == expected.keys()
+    for name, parameter in expected.items():
+        torch.testing.assert_close(restored_base.get_parameter(name), parameter, rtol=0, atol=0)
+    x = torch.randn(2, 64, dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        restored_base.model.layers[1].linear_attn.r_proj(x),
+        model.hf.model.layers[1].linear_attn.r_proj(x),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("use_nora", [False, True])
+def test_native_merged_export(hf_config, use_nora):
+    from megatron.bridge.training.model_load_save import temporary_distributed_context
+
+    bridge = AutoBridge.from_hf_config(hf_config)
+    model = RWKV7Model(bridge.get_model_config(), pg_collection=None)
+    expected = {name: parameter.detach().clone() for name, parameter in model.hf.named_parameters()}
     RWKV7LoRA(dim=4, alpha=8, use_nora=use_nora)(model)
     with torch.no_grad():
         for name, parameter in model.named_parameters():
             if ".lora_B." in name:
                 parameter.normal_(std=0.1)
-    family = bridge._model_bridge
-    tasks = []
-    expected = {}
-    registry = family.mapping_registry()
-    for name, parameter in model.named_parameters():
-        if family._is_adapter_param_name(name):
-            continue
-        mapping = registry.megatron_to_hf_lookup(family._get_lora_unwrapped_name(name))
-        module = model.get_submodule(name.rsplit(".", 1)[0])
-        tasks.append(
-            WeightConversionTask(
-                param_name=name,
-                global_param_name=name,
-                mapping=mapping,
-                pp_rank=0,
-                vp_stage=0,
-                megatron_module=module,
-                param_weight=parameter,
-            )
-        )
-        value = parameter.detach().clone()
-        if ".base_layer." in name:
-            adapter = model.get_submodule(name.removesuffix(".base_layer.weight"))
-            a = adapter.lora_A["default"].weight.float()
-            if use_nora:
-                a = a / (a.norm(dim=0, keepdim=True) + 1e-6)
-            value = (value.float() + 2 * adapter.lora_B["default"].weight.float() @ a).to(value.dtype)
-        expected[mapping.hf_param] = value
-    exported = list(bridge.export_hf_weights([model], conversion_tasks=tasks, show_progress=False, cpu=True))
+        merged = model.hf.model.layers[0].linear_attn.r_proj
+        merged.merge()
+        for name, module in model.hf.named_modules():
+            if not hasattr(module, "lora_A"):
+                continue
+            weight_name = f"{name}.weight"
+            if module is merged:
+                expected[weight_name] = module.base_layer.weight.detach().clone()
+            else:
+                a = module.lora_A["default"].weight.float()
+                if use_nora:
+                    a = a / (a.norm(dim=0, keepdim=True) + 1e-6)
+                weight = expected[weight_name]
+                delta = 2 * (module.lora_B["default"].weight.float() @ a)
+                expected[weight_name] = (weight.float() + delta).to(weight.dtype)
+    with temporary_distributed_context():
+        exported = list(bridge.export_hf_weights([model], show_progress=False, cpu=True))
     assert {item.param_name for item in exported} == expected.keys()
     for item in exported:
         torch.testing.assert_close(item.weight, expected[item.param_name], rtol=0, atol=0)
-    assert len([name for name, _ in model.named_parameters() if family._is_adapter_param_name(name)]) == 24
+    assert len(list(bridge.export_adapter_weights([model], show_progress=False))) == 24
 
 
 @pytest.mark.parametrize("mode", ["scratch", "full", "fsdp", "lora", "nora"])

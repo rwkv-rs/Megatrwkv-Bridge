@@ -23,6 +23,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires 
 
 @pytest.mark.parametrize("use_nora", [False, True])
 def test_native_adapter_export_after_optimizer_step(tmp_path, use_nora):
+    from peft import PeftModel
     from safetensors.torch import load_file
 
     torch.manual_seed(2026)
@@ -56,17 +57,23 @@ def test_native_adapter_export_after_optimizer_step(tmp_path, use_nora):
     adapter_config = json.loads((tmp_path / "adapter_config.json").read_text())
     restored = RwkvForCausalLM(config).to(device="cuda", dtype=torch.bfloat16).eval()
     restored.load_state_dict(base_state)
-    RWKV7LoRA(
-        dim=adapter_config["r"],
-        alpha=adapter_config["lora_alpha"],
-        target_modules=adapter_config["target_modules"],
-        use_nora=adapter_config["use_nora"],
-    )(restored)
-    missing, unexpected = restored.load_state_dict(
-        {name.removeprefix("base_model.model.").replace(".weight", ".default.weight"): p for name, p in saved.items()},
-        strict=False,
-    )
-    assert not unexpected and all("lora_" not in name for name in missing)
+    if use_nora:
+        RWKV7LoRA(
+            dim=adapter_config["r"],
+            alpha=adapter_config["lora_alpha"],
+            target_modules=adapter_config["target_modules"],
+            use_nora=adapter_config["use_nora"],
+        )(restored)
+        missing, unexpected = restored.load_state_dict(
+            {
+                name.removeprefix("base_model.model.").replace(".weight", ".default.weight"): parameter
+                for name, parameter in saved.items()
+            },
+            strict=False,
+        )
+        assert not unexpected and all("lora_" not in name for name in missing)
+    else:
+        restored = PeftModel.from_pretrained(restored, tmp_path)
     with torch.no_grad():
         actual = restored(tokens, use_cache=False).logits.float()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -15,7 +15,11 @@ from transformers import PretrainedConfig
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
 from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
-from megatron.bridge.models.conversion.peft_bridge import AdapterWeight, AdapterWeightConversionTask
+from megatron.bridge.models.conversion.peft_bridge import (
+    AdapterWeight,
+    AdapterWeightConversionTask,
+    _split_hf_lora_weight_name,
+)
 from megatron.bridge.models.rwkv7.modeling_rwkv7 import RWKV7Model
 from megatron.bridge.models.rwkv7.rwkv7_config import RWKV7ModelConfig
 from megatron.bridge.models.transformer_config import TransformerConfig
@@ -36,6 +40,10 @@ class RWKV7Bridge(MegatronModelBridge):
     def _is_adapter_param_name(self, param_name: str) -> bool:
         return param_name.endswith((".lora_A.default.weight", ".lora_B.default.weight"))
 
+    def _adapter_target_modules(self, adapter_weight_names: Iterable[str]) -> list[str]:
+        """Limit PEFT reload to projections that have exported weights."""
+        return sorted({_split_hf_lora_weight_name(name)[0] for name in adapter_weight_names})
+
     def _merge_lora_adapter_weights(
         self,
         megatron_model: list[RWKV7Model],
@@ -47,11 +55,15 @@ class RWKV7Bridge(MegatronModelBridge):
         weights = []
         for adapter in adapter_weights:
             module = models[adapter.linear_in_weight.vp_stage].get_submodule(adapter.global_base_prefix)
+            if "default" in module.merged_adapters:
+                continue
             if module.use_nora["default"]:
                 a = adapter.linear_in_weight.weight.float()
                 a = a / (a.norm(dim=0, keepdim=True) + 1e-6)
                 adapter = replace(adapter, linear_in_weight=adapter.linear_in_weight._replace(weight=a))
             weights.append(adapter)
+        if not weights:
+            return converted_weights_dict
         return super()._merge_lora_adapter_weights(megatron_model, converted_weights_dict, weights)
 
     def build_adapter_conversion_tasks(

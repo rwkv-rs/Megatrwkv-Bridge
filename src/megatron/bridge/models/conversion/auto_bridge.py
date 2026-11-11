@@ -1167,12 +1167,18 @@ class AutoBridge(Generic[MegatronModelT]):
         expand_shared_outer: bool = False,
         allow_serving_layout: bool = False,
     ) -> None:
-        """Save LoRA adapter weights as a HuggingFace PEFT-compatible directory.
+        """Save LoRA adapter weights in Hugging Face PEFT or native serving format.
 
         The output directory contains ``adapter_config.json`` and
-        ``adapter_model.safetensors`` and can be loaded directly with
-        ``peft.PeftModel.from_pretrained(base_model, path)`` -- except when
-        ``allow_serving_layout`` is used, which writes a serving-only layout.
+        ``adapter_model.safetensors``. Standard adapters can be loaded with
+        ``peft.PeftModel.from_pretrained(base_model, path)``.
+
+        RWKV7 NoRA exports the original A/B tensors and records ``use_nora`` in
+        the config. Load it with a NoRA-aware runtime such as irwkv configured
+        for NoRA with matching rank and alpha. Stock PEFT ignores this flag
+        and applies ordinary LoRA. To load a complete model directly in
+        Transformers, use :meth:`save_hf_pretrained` to merge the NoRA weights.
+        See ``allow_serving_layout`` below for serving-only shared-outer MoE exports.
 
         Args:
             model: Megatron model instance or list of instances.

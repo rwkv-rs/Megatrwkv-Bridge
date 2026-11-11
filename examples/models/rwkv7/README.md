@@ -127,6 +127,14 @@ Tokenizer, chat templates and generation configs are copied from the directory
 containing `--config` when it contains `tokenizer_config.json`. Keep the config
 beside the matching tokenizer assets when exporting a complete HF checkpoint.
 
+To save only the adapter, call `bridge.save_hf_adapter(models, path, peft_config)`.
+Load LoRA exports with `PeftModel.from_pretrained(base_model, path)`. For NoRA,
+load the exported directory in irwkv with NoRA enabled and matching rank and
+alpha. The directory preserves the original A/B matrices and records
+`"use_nora": true` in `adapter_config.json`. Stock PEFT ignores that field and
+applies ordinary LoRA. Use `--export-hf` to save a merged model for direct
+loading in Transformers.
+
 For direct conversion, use the shared [conversion examples](../../conversion/)
 or the builder-backed API:
 
