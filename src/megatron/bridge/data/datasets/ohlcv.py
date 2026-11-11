@@ -10,11 +10,12 @@ import logging
 import math
 import multiprocessing
 import random
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, Iterator, TypedDict
 
 import numpy as np
 from numpy.typing import NDArray
@@ -359,6 +360,14 @@ class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):
         """Return the requested native sampler budget."""
         return self.length
 
+    def raw_indices(self, indices: NDArray[np.int64]) -> NDArray[np.int64]:
+        """Resolve sampler indices to the unpermuted split inventory."""
+        if self.cycle_length is not None:
+            indices = indices % self.cycle_length
+        if self.selection is not None:
+            return self.selection[indices % len(self.selection)]
+        return (indices * self.multiplier + self.offset) % self.num_windows
+
     def window(self, index: int) -> tuple[WindowInfo, int, ShardArrays]:
         """Locate a window and mmap its instrument; retain only one open shard."""
         if self.cycle_length is not None:
@@ -372,18 +381,7 @@ class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):
         previous = self.cumulative[instrument_index - 1] if instrument_index else 0
         local_index = index - previous
         if self._cached_path != instrument["path"]:
-            directory = self.root / instrument["path"]
-            self._arrays = ShardArrays(
-                features=np.load(
-                    (self.covariates / instrument["path"] if self.covariates is not None else directory)
-                    / "features.npy",
-                    mmap_mode="r",
-                    allow_pickle=False,
-                ),
-                close=np.load(directory / "close.npy", mmap_mode="r", allow_pickle=False),
-                timestamps=np.load(directory / "timestamps.npy", mmap_mode="r", allow_pickle=False),
-                segments=np.load(directory / "segments.npy", mmap_mode="r", allow_pickle=False),
-            )
+            self._arrays = self._load_shard(instrument["path"])
             self._segment_counts = np.cumsum(self._window_counts(self._arrays["segments"]))
             self._cached_path = instrument["path"]
         assert self._arrays is not None
@@ -393,6 +391,16 @@ class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):
         segment: WindowInfo = {**instrument, "split": self.split, "offset": int(offset), "length": int(length)}
         start = int(offset) + (local_index - previous_segment) * self.stride
         return segment, start, self._arrays
+
+    def _load_shard(self, path: str) -> ShardArrays:
+        directory = self.root / path
+        feature_dir = directory if self.covariates is None else self.covariates / path
+        return ShardArrays(
+            features=np.load(feature_dir / "features.npy", mmap_mode="r", allow_pickle=False),
+            close=np.load(directory / "close.npy", mmap_mode="r", allow_pickle=False),
+            timestamps=np.load(directory / "timestamps.npy", mmap_mode="r", allow_pickle=False),
+            segments=np.load(directory / "segments.npy", mmap_mode="r", allow_pickle=False),
+        )
 
     def __getitem__(self, index: int) -> dict[str, NDArray[np.float32]]:
         """Return aligned teacher-forcing inputs and next-bar labels."""
@@ -422,14 +430,107 @@ def manifest_digest(root: Path) -> str:
 class OHLCVQuantileWindowDataset(OHLCVWindowDataset):
     """Complete historical windows with future cumulative close-return labels."""
 
+    def __init__(self, *args: Any, pvw_cache: Path | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.pvw_cache = pvw_cache
+        self.pvw_metadata: dict[str, Any] | None = None
+        self._pvw_selection: NDArray[np.int64] | None = None
+        self._pvw_values: NDArray[np.float32] | None = None
+        self._shards: OrderedDict[int, tuple[ShardArrays, NDArray[np.int64], NDArray[np.float32] | None]] = (
+            OrderedDict()
+        )
+        if pvw_cache is not None:
+            if self.covariates is None or self.stride != 1:
+                raise ValueError("PVW requires the source covariates and a stride-one window inventory.")
+            metadata = json.loads((pvw_cache / "manifest.json").read_text())
+            if (
+                metadata["source_manifest_sha256"] != manifest_digest(self.root)
+                or metadata["covariates_sha256"] != manifest_digest(self.covariates)
+                or (metadata["context"], metadata["horizon"]) != (self.seq_length, self.horizon)
+                or metadata["windows"][self.split] != self.num_windows
+            ):
+                raise ValueError("PVW cache does not match the source window inventory.")
+            self.pvw_metadata = metadata
+            if self.split != "train":
+                self._pvw_selection = np.load(pvw_cache / f"{self.split}-indices.npy", mmap_mode="r")
+                self._pvw_values = np.load(pvw_cache / f"{self.split}-values.npy", mmap_mode="r")
+
+    def iter_raw_windows(
+        self, raw_indices: NDArray[np.int64]
+    ) -> Iterator[
+        tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.int64], ShardArrays, NDArray[np.float32] | None]
+    ]:
+        """Gather raw split indices by instrument, retaining each input position."""
+        instruments = np.searchsorted(self.cumulative, raw_indices, side="right")
+        order = np.argsort(instruments, kind="stable")
+        boundaries = np.flatnonzero(np.diff(instruments[order])) + 1
+        for positions in np.split(order, boundaries):
+            if not len(positions):
+                continue
+            instrument = int(instruments[positions[0]])
+            if instrument not in self._shards:
+                path = self.instruments[instrument]["path"]
+                arrays = self._load_shard(path)
+                prefix = np.cumsum(self._window_counts(arrays["segments"]))
+                values = None
+                if self.pvw_cache is not None and self.split == "train":
+                    values = np.load(self.pvw_cache / "train" / path / "values.npy", mmap_mode="r")
+                self._shards[instrument] = arrays, prefix, values
+                if len(self._shards) > 128:
+                    self._shards.popitem(last=False)
+            self._shards.move_to_end(instrument)
+            arrays, prefix, values = self._shards[instrument]
+            raw = raw_indices[positions]
+            local = raw - (self.cumulative[instrument - 1] if instrument else 0)
+            segment = np.searchsorted(prefix, local, side="right")
+            prior = np.where(segment > 0, prefix[segment - 1], 0)
+            starts = arrays["segments"][segment, 0] + (local - prior) * self.stride
+            if self._pvw_selection is not None:
+                assert self._pvw_values is not None
+                rows = np.searchsorted(self._pvw_selection, raw)
+                if np.any(rows >= len(self._pvw_selection)) or np.any(self._pvw_selection[rows] != raw):
+                    raise ValueError("The requested evaluation window is not in the frozen PVW cache.")
+                denoised = self._pvw_values[rows]
+            else:
+                denoised = values[local] if values is not None else None
+            yield positions, raw, starts, arrays, denoised
+
+    def __getitems__(self, indices: list[int]) -> list[dict[str, NDArray[np.float32]]]:
+        """Read a microbatch in instrument order and restore sampler order."""
+        sampler_indices = np.asarray(indices, dtype=np.int64)
+        valid = np.arange(len(indices))
+        if self.epochs is not None:
+            valid = valid[sampler_indices < self.num_windows * self.epochs]
+        raw_indices = self.raw_indices(sampler_indices[valid])
+        channels = len(FEATURE_NAMES)
+        if self.pvw_metadata is not None:
+            columns = self.pvw_metadata["columns"]
+            channels = len(columns) + 1
+        elif self.covariates is not None:
+            from megatron.bridge.data.datasets.ohlcv_covariates import FORECAST_FEATURE_NAMES
+
+            channels = len(FORECAST_FEATURE_NAMES)
+        features = np.zeros((len(indices), self.seq_length, channels), dtype=np.float32)
+        labels = np.zeros((len(indices), self.horizon), dtype=np.float32)
+        mask = np.zeros_like(labels)
+        history = np.arange(self.seq_length)
+        future = self.seq_length + np.arange(self.horizon)
+        for positions, _, starts, arrays, denoised in self.iter_raw_windows(raw_indices):
+            rows = valid[positions]
+            values = arrays["features"][starts[:, None] + history]
+            if denoised is None:
+                features[rows] = values
+            else:
+                features[rows, :, :-1] = values[..., columns]
+                features[rows, :, -1] = denoised
+            anchor = arrays["close"][starts + self.seq_length - 1]
+            labels[rows] = PRICE_SCALE * np.log(arrays["close"][starts[:, None] + future] / anchor[:, None])
+            mask[rows] = 1
+        return [
+            {"features": values, "labels": target, "loss_mask": weights}
+            for values, target, weights in zip(features, labels, mask, strict=True)
+        ]
+
     def __getitem__(self, index: int) -> dict[str, NDArray[np.float32]]:
         """Return historical inputs and every future close relative to one anchor."""
-        _, start, arrays = self.window(index)
-        end = start + self.seq_length
-        anchor = arrays["close"][end - 1]
-        targets = PRICE_SCALE * np.log(arrays["close"][end : end + self.horizon] / anchor)
-        return {
-            "features": np.array(arrays["features"][start:end], dtype=np.float32),
-            "labels": targets.astype(np.float32),
-            "loss_mask": np.ones(self.horizon, dtype=np.float32),
-        }
+        return self.__getitems__([index])[0]

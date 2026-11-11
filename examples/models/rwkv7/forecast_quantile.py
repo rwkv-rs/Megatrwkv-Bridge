@@ -111,8 +111,21 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
                 raise ValueError("Covariate identity differs from the checkpoint.")
     elif covariates is not None:
         raise ValueError("This checkpoint does not use covariates.")
+    pvw_cache = getattr(args, "pvw_cache", None)
+    if expected_pvw := payload["run"].get("pvw_cache_sha256"):
+        pvw_cache = pvw_cache or Path(payload["run"]["pvw_cache"])
+        if manifest_digest(pvw_cache) != expected_pvw:
+            raise ValueError("PVW cache identity differs from the checkpoint.")
+    elif pvw_cache is not None:
+        raise ValueError("This checkpoint does not use a PVW cache.")
     dataset = OHLCVQuantileWindowDataset(
-        args.data, split=args.split, seq_length=context, horizon=horizon, stride=stride, covariates=covariates
+        args.data,
+        split=args.split,
+        seq_length=context,
+        horizon=horizon,
+        stride=stride,
+        covariates=covariates,
+        pvw_cache=pvw_cache,
     )
     if not args.windows:
         indices = np.linspace(0, len(dataset) - 1, min(args.max_windows, len(dataset)), dtype=np.int64)
@@ -142,7 +155,11 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
         identities.append(identity)
     anchor = np.asarray(anchors)
     truth = np.asarray(actual)
-    all_inputs = np.asarray(inputs_list)
+    if pvw_cache is not None:
+        samples = dataset.__getitems__([row["index"] for row in windows])
+        all_inputs = np.stack([sample["features"] for sample in samples])
+    else:
+        all_inputs = np.asarray(inputs_list)
     raw = []
     for begin in range(0, len(all_inputs), 256):
         inputs = torch.from_numpy(all_inputs[begin : begin + 256]).cuda()

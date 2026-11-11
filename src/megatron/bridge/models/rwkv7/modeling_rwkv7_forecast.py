@@ -31,7 +31,12 @@ class RWKV7ForecastConfig(RWKV7ModelConfig):
         total += float(tokens * 6 * self.hidden_size * (inputs - self.vocab_size))
         if self.hf_config.get("forecast_task", "next_bar") == "direct_quantile":
             outputs = self.hf_config["forecast_horizon"] * len(self.hf_config["forecast_quantiles"])
-            return total + float(batch_size * 6 * self.hidden_size * outputs)
+            total += batch_size * 6 * self.hidden_size * outputs
+            if self.hf_config.get("forecast_architecture") == "cnn_rwkv_attention":
+                width = self.hidden_size
+                total += tokens * 6 * inputs * (3 * 8 + 7 * width)
+                total += batch_size * 6 * (inputs * (8 * 128 + 2 * 128**2 + 2 * 128) + 128**2 + 2 * width * 128)
+            return total
         return total + float(tokens * 6 * self.hidden_size * 5)
 
 
@@ -41,6 +46,34 @@ class RWKV7ForecastHead(nn.Linear):
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Project in FP32 while preserving the parameter storage precision."""
         return F.linear(hidden.float(), self.weight.float(), self.bias.float())
+
+
+class ForecastFeatureMixer(nn.Module):
+    """Encode local patterns and mix named feature tokens at the forecast origin."""
+
+    def __init__(self, input_size: int, hidden_size: int) -> None:
+        super().__init__()
+        self.input_size = input_size
+        self.conv = nn.Conv1d(input_size, input_size * 8, 3, groups=input_size, dtype=torch.bfloat16)
+        self.project = nn.Linear(input_size * 8, hidden_size, dtype=torch.bfloat16)
+        self.feature_projection = nn.Linear(8, 128, dtype=torch.bfloat16)
+        self.feature_id = nn.Parameter(torch.empty(input_size, 128, dtype=torch.bfloat16))
+        nn.init.normal_(self.feature_id, std=0.02)
+        self.query = nn.Linear(hidden_size, 128, dtype=torch.bfloat16)
+        self.attention = nn.MultiheadAttention(128, 4, batch_first=True, dtype=torch.bfloat16)
+        self.output = nn.Linear(128, hidden_size, dtype=torch.bfloat16)
+
+    def encode(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the RWKV input and the per-feature tokens at the last minute."""
+        local = F.gelu(self.conv(F.pad(inputs.transpose(1, 2), (2, 0))))
+        tokens = self.feature_projection(local[:, :, -1].reshape(-1, self.input_size, 8))
+        return self.project(local.transpose(1, 2)), tokens + self.feature_id
+
+    def forward(self, hidden: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        """Mix features using one query derived from the RWKV forecast state."""
+        query = self.query(hidden).unsqueeze(1)
+        mixed, _ = self.attention(query, tokens, tokens, need_weights=False)
+        return hidden + self.output(mixed.squeeze(1))
 
 
 class RWKV7ForecastModel(RWKV7Model):
@@ -56,7 +89,11 @@ class RWKV7ForecastModel(RWKV7Model):
         self.hf = self.hf.model
         self.hf.embed_tokens = nn.Identity()
         self.input_size = getattr(self.hf.config, "forecast_input_size", 5)
-        self.input_projection = nn.Linear(self.input_size, model_config.hidden_size, dtype=torch.bfloat16)
+        self.feature_mixer: ForecastFeatureMixer | None = None
+        if getattr(self.hf.config, "forecast_architecture", "linear") == "cnn_rwkv_attention":
+            self.feature_mixer = ForecastFeatureMixer(self.input_size, model_config.hidden_size)
+        else:
+            self.input_projection = nn.Linear(self.input_size, model_config.hidden_size, dtype=torch.bfloat16)
         self.direct_quantile = getattr(self.hf.config, "forecast_task", "next_bar") == "direct_quantile"
         if self.direct_quantile:
             self.horizon = self.hf.config.forecast_horizon
@@ -77,7 +114,7 @@ class RWKV7ForecastModel(RWKV7Model):
             ):
                 self.register_buffer(
                     name,
-                    torch.tensor(values, device=self.input_projection.weight.device, dtype=torch.bfloat16),
+                    torch.tensor(values, device=self.output_projection.weight.device, dtype=torch.bfloat16),
                     persistent=False,
                 )
         if getattr(self.hf.config, "forecast_initialization", "linear") == "calibrated":
@@ -85,15 +122,16 @@ class RWKV7ForecastModel(RWKV7Model):
             with torch.no_grad():
                 # A separate constant direction keeps zero-volume, unchanged
                 # bars away from the zero-variance input of embedding LayerNorm.
-                weight = torch.empty(
-                    model_config.hidden_size,
-                    self.input_size + 1,
-                    device=self.input_projection.weight.device,
-                    dtype=torch.float32,
-                )
-                nn.init.orthogonal_(weight, gain=(model_config.hidden_size / (self.input_size + 1)) ** 0.5)
-                self.input_projection.weight.copy_(weight[:, : self.input_size])
-                self.input_projection.bias.copy_(weight[:, self.input_size])
+                if self.feature_mixer is None:
+                    weight = torch.empty(
+                        model_config.hidden_size,
+                        self.input_size + 1,
+                        device=self.input_projection.weight.device,
+                        dtype=torch.float32,
+                    )
+                    nn.init.orthogonal_(weight, gain=(model_config.hidden_size / (self.input_size + 1)) ** 0.5)
+                    self.input_projection.weight.copy_(weight[:, : self.input_size])
+                    self.input_projection.bias.copy_(weight[:, self.input_size])
                 weight = torch.empty_like(self.output_projection.weight, dtype=torch.float32)
                 nn.init.orthogonal_(weight, gain=self.hf.config.forecast_head_gain)
                 self.output_projection.weight.copy_(weight)
@@ -125,20 +163,24 @@ class RWKV7ForecastModel(RWKV7Model):
         inputs = features.float()
         if self.normalize_inputs:
             inputs = (inputs - self.feature_mean.float()) / self.feature_std.float()
+        inputs = inputs.to(self.output_projection.weight.dtype)
+        if self.feature_mixer is None:
+            embeddings = self.input_projection(inputs)
+        else:
+            embeddings, feature_tokens = self.feature_mixer.encode(inputs)
         hidden = self.hf(
-            inputs_embeds=self.input_projection(inputs.to(self.input_projection.weight.dtype)),
+            inputs_embeds=embeddings,
             past_key_values=past_key_values,
             use_cache=past_key_values is not None,
         ).last_hidden_state
         if self.direct_quantile:
-            prediction = (
-                self.output_projection(hidden[:, -1]).view(-1, self.horizon, len(self.quantile_levels)).float()
-            )
+            state = hidden[:, -1]
+            if self.feature_mixer is not None:
+                state = self.feature_mixer(state, feature_tokens)
+            prediction = self.output_projection(state).view(-1, self.horizon, len(self.quantile_levels)).float()
             if labels is None:
                 return prediction
-            error = labels.float().unsqueeze(-1) - prediction
-            levels = prediction.new_tensor(self.quantile_levels)
-            losses = torch.maximum(levels * error, (levels - 1) * error)
+            losses = forecast_pinball(prediction, labels, self.quantile_levels)
             return losses if return_channel_losses else losses.mean(-1)
         raw = self.output_projection(hidden).float()
         # Positive wicks guarantee high >= max(open, close), low <= min(open, close).
@@ -181,6 +223,13 @@ class RWKV7ForecastModel(RWKV7Model):
             prediction = self(prediction, past_key_values=cache)
             bars.append(prediction)
         return torch.cat(bars, dim=1)
+
+
+def forecast_pinball(predictions: torch.Tensor, labels: torch.Tensor, levels: tuple[float, ...]) -> torch.Tensor:
+    """Return the unreduced FP32 pinball loss."""
+    error = labels.float().unsqueeze(-1) - predictions
+    quantiles = predictions.new_tensor(levels)
+    return torch.maximum(quantiles * error, (quantiles - 1) * error)
 
 
 class RWKV7ForecastBuilder(RWKV7ModelBuilder):

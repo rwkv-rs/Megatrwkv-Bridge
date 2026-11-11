@@ -65,12 +65,28 @@ def train(args: argparse.Namespace) -> None:
     hf.vocab_size = 1
     hf.tie_word_embeddings = False
     direct = getattr(args, "task", "next_bar") == "direct_quantile"
-    dataset_class = partial(OHLCVQuantileWindowDataset, covariates=args.covariates) if direct else OHLCVWindowDataset
+    pvw_cache = getattr(args, "pvw_cache", None)
+    architecture = getattr(args, "forecast_architecture", None)
+    data_workers = getattr(args, "data_workers", None)
+    dataset_class = (
+        partial(OHLCVQuantileWindowDataset, covariates=args.covariates, pvw_cache=pvw_cache)
+        if direct
+        else OHLCVWindowDataset
+    )
+    if architecture is not None:
+        hf.forecast_architecture = architecture
     if direct:
         hf.forecast_task = "direct_quantile"
         hf.forecast_horizon = args.forecast_horizon
         hf.forecast_quantiles = [i / 10 for i in range(1, 10)]
-    if args.covariates:
+    if pvw_cache:
+        metadata = json.loads((pvw_cache / "manifest.json").read_text())
+        hf.forecast_input_size = len(metadata["feature_names"])
+        hf.forecast_feature_names = metadata["feature_names"]
+        hf.forecast_pvw = {key: metadata[key] for key in ("modes", "alpha", "columns")}
+        if metadata["validation_indices_sha256"] != hashlib.sha256(args.validation_indices.read_bytes()).hexdigest():
+            raise ValueError("Validation indices do not match the PVW cache.")
+    elif args.covariates:
         from megatron.bridge.data.datasets.ohlcv_covariates import FORECAST_FEATURE_NAMES
 
         hf.forecast_input_size = len(FORECAST_FEATURE_NAMES)
@@ -125,18 +141,20 @@ def train(args: argparse.Namespace) -> None:
     if args.rwkv_optimizer:
         hf.forecast_optimizer = "rwkv_lm"
     # Count actual windows before resolving an epoch-based optimizer-step budget.
+    epoch_windows = None
     for split in ("train", "validation", "test") if args.eval_iters else ("train",):
         dataset = dataset_class(
             args.data,
             split=split,
             seq_length=args.context,
             horizon=args.forecast_horizon if direct else 1,
-            stride=args.context if args.epochs is not None else 1,
-            keep_tail=args.epochs is not None,
+            stride=args.context if args.epochs is not None and not direct else 1,
+            keep_tail=args.epochs is not None and not direct,
         )
         logger.info("%s: %d available windows", split, dataset.num_windows)
         if split == "train" and args.epochs is not None:
-            args.steps = math.ceil(dataset.num_windows * args.epochs / args.global_batch_size)
+            epoch_windows = dataset.num_windows * args.epochs
+            args.steps = math.ceil(epoch_windows / args.global_batch_size)
             logger.info("%d epoch(s) resolve to %d optimizer steps", args.epochs, args.steps)
         if split == "train" and additional_epochs is not None:
             additional_steps = math.ceil(dataset.num_windows * additional_epochs / args.global_batch_size)
@@ -168,11 +186,16 @@ def train(args: argparse.Namespace) -> None:
     if args.covariates is not None:
         run["covariates"] = str(args.covariates)
         run["covariates_sha256"] = hashlib.sha256((args.covariates / "manifest.json").read_bytes()).hexdigest()
+    if pvw_cache is not None:
+        run["pvw_cache"] = str(pvw_cache)
+        run["pvw_cache_sha256"] = manifest_digest(pvw_cache)
+    if data_workers is not None:
+        run["data_workers"] = data_workers
     if args.validation_indices is not None:
         run["validation_indices"] = str(args.validation_indices)
         run["validation_indices_sha256"] = hashlib.sha256(args.validation_indices.read_bytes()).hexdigest()
     if direct:
-        samples = args.steps * args.global_batch_size
+        samples = epoch_windows if epoch_windows is not None else args.steps * args.global_batch_size
         run["sample_budget"] = {
             "windows": samples,
             "history_bars": samples * args.context,
@@ -265,6 +288,8 @@ def train(args: argparse.Namespace) -> None:
         epochs=args.epochs,
         covariates=args.covariates,
         validation_indices=args.validation_indices,
+        pvw_cache=pvw_cache,
+        data_workers=data_workers,
     )
     cfg.checkpoint.load = str(load) if load else None
     cfg.checkpoint.ckpt_step = args.checkpoint_step
@@ -344,7 +369,28 @@ def predict(args: argparse.Namespace) -> None:
     if not segments or segments[-1][1] != len(bars) or segments[-1][1] - segments[-1][0] < 2:
         raise ValueError("Instrument must end with at least two valid contiguous minute bars.")
     context = min(trained_context, segments[-1][1] - segments[-1][0] - 1)
-    features = torch.from_numpy(encode_bars(bars[-context - 1 :])).unsqueeze(0).cuda()
+    hf_config = payload["run"]["hf_config"]
+    if model.direct_quantile and model.input_size > 5:
+        from hf_forecast.processing_rwkv7_forecast import prepare_features
+
+        if getattr(args, "market", None) is None:
+            raise ValueError("Covariate checkpoints require --market with three same-minute market columns.")
+        start, _ = segments[-1]
+        if context != trained_context:
+            raise ValueError("Covariate prediction requires the complete trained context.")
+        market = np.load(args.market, allow_pickle=False)
+        if market.shape != (len(bars), 3):
+            raise ValueError("Market rows must align with the instrument bars.")
+        values, _ = prepare_features(bars[start:], timestamps[start:], market[start:], context_length=context)
+        features = torch.from_numpy(values).unsqueeze(0).cuda()
+        if pvw := hf_config.get("forecast_pvw"):
+            from megatron.bridge.data.datasets.ohlcv_vmd import denoise_history
+
+            close = torch.from_numpy(bars[-context:, 3].copy()).unsqueeze(0).cuda()
+            filtered = denoise_history(close, modes=pvw["modes"], alpha=pvw["alpha"])
+            features = torch.cat((features[..., pvw["columns"]], filtered.unsqueeze(-1)), dim=-1)
+    else:
+        features = torch.from_numpy(encode_bars(bars[-context - 1 :])).unsqueeze(0).cuda()
     if model.direct_quantile:
         if args.horizon > model.horizon:
             raise ValueError("Requested horizon exceeds the trained direct forecast horizon.")
@@ -491,7 +537,7 @@ def main() -> None:
     budget = training.add_mutually_exclusive_group()
     budget.add_argument("--steps", type=int, help="Optimizer steps; defaults to 10000 without --epochs")
     budget.add_argument(
-        "--epochs", type=int, help="Complete passes with nonoverlapping targets, retaining tail windows"
+        "--epochs", type=int, help="Complete stride-one direct quantile epochs or nonoverlapping next-bar epochs"
     )
     budget.add_argument(
         "--additional-epochs",
@@ -536,12 +582,16 @@ def main() -> None:
     )
     training.add_argument("--covariates", type=Path, help="Prepared past-only market and temporal feature cache")
     training.add_argument("--validation-indices", type=Path, help="Frozen stride-one validation index NPY")
+    training.add_argument("--pvw-cache", type=Path, help="Frozen per-origin PVW feature cache")
+    training.add_argument("--forecast-architecture", choices=("cnn_rwkv_attention",))
+    training.add_argument("--data-workers", type=int, help="Persistent DataLoader workers per rank")
     training.set_defaults(handler=train)
     prediction = commands.add_parser("predict", help="Autoregressively generate future OHLCV bars")
     prediction.add_argument("--checkpoint", type=Path, required=True)
     prediction.add_argument("--instrument", type=Path, required=True)
     prediction.add_argument("--output", type=Path, required=True)
     prediction.add_argument("--horizon", type=int, required=True)
+    prediction.add_argument("--market", type=Path, help="Same-minute market statistics NPY aligned to instrument rows")
     prediction.set_defaults(handler=predict)
     evaluation = commands.add_parser("evaluate", help="Free-running holdout evaluation against persistence")
     evaluation.add_argument("--checkpoint", type=Path, required=True)
@@ -554,7 +604,19 @@ def main() -> None:
     evaluation.add_argument("--baseline-paths", type=Path, help="Earlier autoregressive prediction NPZ")
     evaluation.add_argument("--covariates", type=Path, help="Feature cache matching the checkpoint")
     evaluation.add_argument("--metrics-only", action="store_true", help="Skip large prediction arrays, CSV and plots")
+    evaluation.add_argument("--pvw-cache", type=Path, help="PVW cache matching the checkpoint")
     evaluation.set_defaults(handler=evaluate)
+    pvw = commands.add_parser("prepare-pvw", help="Fit and cache PVW features by forecast origin")
+    for argument in ("data", "covariates", "validation-indices", "test-windows", "output"):
+        pvw.add_argument(f"--{argument}", type=Path, required=True)
+    pvw.add_argument("--batch-size", type=int, required=True)
+
+    def cache_pvw(args: argparse.Namespace) -> None:
+        from forecast_pvw import prepare_pvw
+
+        prepare_pvw(args)
+
+    pvw.set_defaults(handler=cache_pvw)
     covariates = commands.add_parser("prepare-covariates", help="Cache past-only temporal/market covariates")
     covariates.add_argument("--data", type=Path, required=True)
     covariates.add_argument("--output", type=Path, required=True)
@@ -588,15 +650,31 @@ def main() -> None:
             args.command == "prepare-covariates" and args.workers <= 0
         ):
             parser.error("Counts, window lengths and worker count must be positive")
+    if args.command == "prepare-pvw" and args.batch_size <= 0:
+        parser.error("PVW batch size must be positive")
     if args.command == "train":
+        if args.pvw_cache is not None and (
+            args.task != "direct_quantile"
+            or args.context != 64
+            or args.forecast_horizon != 30
+            or not args.covariates
+            or not args.validation_indices
+        ):
+            parser.error("PVW requires direct_quantile, 64/30 windows, covariates and frozen validation indices")
+        if args.forecast_architecture is not None and args.task != "direct_quantile":
+            parser.error("CNN with feature attention requires direct_quantile")
+        if args.epochs is not None and args.fork_from is not None and args.task == "direct_quantile":
+            parser.error("Use --additional-epochs to continue a direct quantile run in a new output directory")
+        if args.data_workers is not None and args.data_workers < 0:
+            parser.error("Data worker count cannot be negative")
         if args.additional_epochs is not None and (
             args.additional_epochs <= 0 or args.fork_from is None or args.task != "direct_quantile"
         ):
             parser.error("Positive --additional-epochs requires direct_quantile and --fork-from")
         if (args.covariates or args.validation_indices) and args.task != "direct_quantile":
             parser.error("Covariates and frozen validation indices require direct_quantile")
-        if args.task == "direct_quantile" and (args.epochs is not None or args.forecast_horizon <= 0):
-            parser.error("direct_quantile requires a positive --forecast-horizon and a --steps budget")
+        if args.task == "direct_quantile" and args.forecast_horizon <= 0:
+            parser.error("direct_quantile requires a positive --forecast-horizon")
         if not math.isfinite(args.learning_rate_scale) or args.learning_rate_scale <= 0:
             parser.error("--learning-rate-scale must be positive and finite")
         if (args.checkpoint_step is not None) != (args.fork_from is not None):

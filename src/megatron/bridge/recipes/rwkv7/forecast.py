@@ -18,7 +18,7 @@ from transformers import RwkvConfig
 from megatron.bridge.data.base import DatasetBuildContext, DatasetProvider
 from megatron.bridge.data.datasets.ohlcv import OHLCVQuantileWindowDataset, OHLCVWindowDataset
 from megatron.bridge.models.conversion.utils import unwrap_model
-from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import RWKV7ForecastConfig
+from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import RWKV7ForecastConfig, forecast_pinball
 from megatron.bridge.recipes.rwkv7.rwkv7 import rwkv7_pretrain_config
 from megatron.bridge.training.callbacks import Callback, CallbackContext
 from megatron.bridge.training.config import (
@@ -83,6 +83,9 @@ class ForecastRun(TypedDict):
     covariates_sha256: NotRequired[str]
     validation_indices: NotRequired[str]
     validation_indices_sha256: NotRequired[str]
+    pvw_cache: NotRequired[str]
+    pvw_cache_sha256: NotRequired[str]
+    data_workers: NotRequired[int]
 
 
 class ForecastCheckpoint(TypedDict):
@@ -108,13 +111,19 @@ class OHLCVDatasetConfig(DatasetProvider):
     forecast_horizon: int = 1
     covariates: str | None = None
     validation_indices: str | None = None
+    pvw_cache: str | None = None
 
     def build_datasets(
         self, context: DatasetBuildContext
     ) -> tuple[OHLCVWindowDataset | None, OHLCVWindowDataset | None, OHLCVWindowDataset | None]:
         """Build requested splits with the sample lengths expected by Bridge."""
         datasets: list[OHLCVWindowDataset | None] = []
-        dataset_class = OHLCVQuantileWindowDataset if self.forecast_task == "direct_quantile" else OHLCVWindowDataset
+        direct = self.forecast_task == "direct_quantile"
+        dataset_class = (
+            partial(OHLCVQuantileWindowDataset, pvw_cache=Path(self.pvw_cache) if self.pvw_cache else None)
+            if direct
+            else OHLCVWindowDataset
+        )
         for split, count in zip(
             ("train", "validation", "test"),
             (context.train_samples, context.valid_samples, context.test_samples),
@@ -131,8 +140,8 @@ class OHLCVDatasetConfig(DatasetProvider):
                     seq_length=self.seq_length,
                     target_length=count,
                     seed=self.seed if split == "train" else self.seed + 1,
-                    stride=self.seq_length if self.epochs is not None else 1,
-                    keep_tail=self.epochs is not None,
+                    stride=self.seq_length if self.epochs is not None and not direct else 1,
+                    keep_tail=self.epochs is not None and not direct,
                     epochs=self.epochs if split == "train" else None,
                     cycle_length=self.evaluation_samples if split != "train" else None,
                     covariates=Path(self.covariates) if self.covariates else None,
@@ -163,6 +172,8 @@ def rwkv7_ohlcv_config(
     epochs: int | None = None,
     covariates: Path | None = None,
     validation_indices: Path | None = None,
+    pvw_cache: Path | None = None,
+    data_workers: int | None = None,
 ) -> ConfigContainer:
     """Build continuous RWKV7 training with fixed, distributed holdout windows.
 
@@ -181,9 +192,10 @@ def rwkv7_ohlcv_config(
         forecast_task=getattr(hf_config, "forecast_task", "next_bar"),
         forecast_horizon=getattr(hf_config, "forecast_horizon", 1),
         evaluation_samples=global_batch_size * eval_iters if eval_iters else None,
-        num_workers=4 if covariates else 2,
+        num_workers=data_workers if data_workers is not None else (4 if covariates else 2),
         covariates=str(covariates) if covariates else None,
         validation_indices=str(validation_indices) if validation_indices else None,
+        pvw_cache=str(pvw_cache) if pvw_cache else None,
     )
     cfg.model.calculate_per_token_loss = True
     cfg.ddp.average_in_collective = False
@@ -213,6 +225,7 @@ def forecast_loss(
     loss_mask: torch.Tensor | None = None,
     channel_losses: torch.Tensor | None = None,
     quantile_levels: tuple[float, ...] = (),
+    price_error: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Return summed per-bar loss and counts for native DP normalization."""
     mask = torch.ones_like(output) if loss_mask is None else loss_mask
@@ -233,6 +246,8 @@ def forecast_loss(
     elif channel_losses is not None:
         for i, name in enumerate(("open", "close", "upper_wick", "lower_wick", "volume")):
             report[f"ohlcv/{name}"] = torch.stack(((channel_losses[..., i] * mask).sum(), count.float()))
+    if price_error is not None:
+        report["forecast/median_price_mae"] = torch.stack(((price_error * mask).sum(), count.float()))
     return loss, count, report
 
 
@@ -243,14 +258,23 @@ def forecast_forward_step(
     batch = next(data_iterator)
     features = batch["features"].cuda(non_blocking=True)
     labels = batch["labels"].cuda(non_blocking=True)
-    output = model(features=features, labels=labels, return_channel_losses=True)
+    levels = tuple(state.cfg.model.hf_config.get("forecast_quantiles", ()))
+    price_error = None
+    if levels and not model.training and state.cfg.dataset.epochs is not None:
+        predictions = model(features=features)
+        output = forecast_pinball(predictions, labels, levels)
+        median = predictions.sort(dim=-1).values[..., levels.index(0.5)]
+        price_error = 100 * (torch.exp(median / 100) - torch.exp(labels / 100)).abs()
+    else:
+        output = model(features=features, labels=labels, return_channel_losses=True)
     return output.mean(-1), partial(
         forecast_loss,
         check_for_nan_in_loss=state.cfg.rerun_state_machine.check_for_nan_in_loss,
         check_for_spiky_loss=state.cfg.rerun_state_machine.check_for_spiky_loss,
         loss_mask=batch["loss_mask"].cuda(non_blocking=True),
         channel_losses=output.detach(),
-        quantile_levels=tuple(state.cfg.model.hf_config.get("forecast_quantiles", ())),
+        quantile_levels=levels,
+        price_error=price_error,
     )
 
 
@@ -288,7 +312,8 @@ class ForecastExportCallback(Callback):
             self.best_loss = json.loads(selection.read_text())["pinball"]
         median_selection = output / "best-median-validation.json"
         if median_selection.exists():
-            self.best_median_loss = json.loads(median_selection.read_text())["median_return_mae"]
+            record = json.loads(median_selection.read_text())
+            self.best_median_loss = record.get("median_price_mae", record["median_return_mae"])
 
     def on_eval_end(self, context: CallbackContext) -> None:
         """Export the earliest minimum on the fixed validation windows."""
@@ -298,6 +323,9 @@ class ForecastExportCallback(Callback):
         score = float(context.total_loss_dict["forecast pinball"])
         median_score = 2 * float(context.total_loss_dict["forecast/q0.5"])
         record = {"step": context.state.train_state.step, "pinball": score, "median_return_mae": median_score}
+        if "forecast/median_price_mae" in context.total_loss_dict:
+            median_score = float(context.total_loss_dict["forecast/median_price_mae"])
+            record["median_price_mae"] = median_score
         if torch.distributed.get_rank() == 0:
             with (self.output / "validation.jsonl").open("a") as stream:
                 stream.write(json.dumps(record) + "\n")
@@ -314,6 +342,7 @@ class ForecastExportCallback(Callback):
 
     def _export(self, context: CallbackContext, name: str) -> None:
         model = unwrap_model(context.model)[0]
+        temporary = self.output / f"{name}.pending"
         torch.save(
             {
                 "version": 1,
@@ -321,8 +350,9 @@ class ForecastExportCallback(Callback):
                 "step": context.state.train_state.step,
                 "state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
             },
-            self.output / name,
+            temporary,
         )
+        temporary.replace(self.output / name)
 
     def on_train_end(self, context: CallbackContext) -> None:
         """Save inference weights after the native training checkpoint lifecycle."""
