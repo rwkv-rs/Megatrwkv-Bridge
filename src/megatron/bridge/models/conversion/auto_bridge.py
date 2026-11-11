@@ -1174,11 +1174,21 @@ class AutoBridge(Generic[MegatronModelT]):
         ``peft.PeftModel.from_pretrained(base_model, path)``.
 
         RWKV7 NoRA exports the original A/B tensors and records ``use_nora`` in
-        the config. Load it with a NoRA-aware runtime such as irwkv configured
-        for NoRA with matching rank and alpha. Stock PEFT ignores this flag
-        and applies ordinary LoRA. To load a complete model directly in
-        Transformers, use :meth:`save_hf_pretrained` to merge the NoRA weights.
+        the config. In irwkv's ``rwkv_lora`` configuration, set ``use_nora`` to
+        ``true`` and match ``r`` and ``lora_alpha`` to the export. Set the required
+        ``target_modules`` to the irwkv selectors for the exported projections.
+        For the default RWKV7 adapter, use ``r_proj``, ``k_proj``, ``v_proj``,
+        ``o_proj``, ``mlp.key``, and ``mlp.value``. The exported
+        ``adapter_config.json`` lists full HF module paths for PEFT. See the
+        `irwkv serving configuration and adapter request example`_.
+
+        Stock PEFT ignores ``use_nora`` and applies ordinary LoRA. To load a
+        complete model directly in Transformers, use :meth:`save_hf_pretrained`
+        to merge the NoRA weights.
         See ``allow_serving_layout`` below for serving-only shared-outer MoE exports.
+
+        .. _irwkv serving configuration and adapter request example:
+           https://github.com/rwkv-org/irwkv/blob/81b2f7f128603171a7c5bc4f28c44cc7641251b0/docs/models/rwkv.md#L199-L248
 
         Args:
             model: Megatron model instance or list of instances.

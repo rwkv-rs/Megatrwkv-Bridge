@@ -129,8 +129,15 @@ beside the matching tokenizer assets when exporting a complete HF checkpoint.
 
 To save only the adapter, call `bridge.save_hf_adapter(models, path, peft_config)`.
 Load LoRA exports with `PeftModel.from_pretrained(base_model, path)`. For NoRA,
-load the exported directory in irwkv with NoRA enabled and matching rank and
-alpha. The directory preserves the original A/B matrices and records
+point an irwkv adapter request at the exported directory. In the serving
+model's `rwkv_lora` configuration, set `use_nora` to `true` and match `r` and
+`lora_alpha` to `adapter_config.json`. The required `rwkv_lora.target_modules`
+must cover the exported projections using irwkv selectors. For the default
+RWKV7 adapter, use `["r_proj", "k_proj", "v_proj", "o_proj", "mlp.key", "mlp.value"]`.
+The exported `adapter_config.json` lists full HF module paths for PEFT.
+[irwkv serving configuration and adapter request example](https://github.com/rwkv-org/irwkv/blob/81b2f7f128603171a7c5bc4f28c44cc7641251b0/docs/models/rwkv.md#L199-L248)
+
+The NoRA export preserves the original A/B matrices and records
 `"use_nora": true` in `adapter_config.json`. Stock PEFT ignores that field and
 applies ordinary LoRA. Use `--export-hf` to save a merged model for direct
 loading in Transformers.
