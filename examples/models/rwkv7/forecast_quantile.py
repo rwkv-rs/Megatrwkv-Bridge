@@ -184,6 +184,16 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
         np.testing.assert_allclose(previous["actual"][..., 3], truth, rtol=1e-6, atol=1e-6)
         point["autoregressive"] = point_metrics(truth, previous["baseline"][..., 3], anchor)
     probabilistic_baselines = {}
+    previous_median = None
+    if previous_path := getattr(args, "direct_baseline_paths", None):
+        with np.load(previous_path, allow_pickle=False) as previous:
+            np.testing.assert_array_equal(previous["timestamps"], np.asarray(times))
+            np.testing.assert_array_equal(previous["anchors"], anchor)
+            np.testing.assert_array_equal(previous["actual"], truth)
+            np.testing.assert_array_equal(previous["levels"], levels)
+            probabilistic_baselines["previous_direct"] = previous["quantiles"]
+            previous_median = previous["prices"][..., int(np.argmin(abs(levels - 0.5)))]
+            point["previous_direct"] = point_metrics(truth, previous_median, anchor)
     calibration_path = args.checkpoint.parent / "calibration.npz"
     if calibration_path.exists():
         calibration = np.load(calibration_path, allow_pickle=False)
@@ -194,15 +204,22 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
 
             vol_column = FORECAST_FEATURE_NAMES.index("volatility_60")
             session_column = FORECAST_FEATURE_NAMES.index("afternoon")
-            boundaries = np.quantile(x_train[:, vol_column], [0.25, 0.5, 0.75])
-            train_group = np.searchsorted(boundaries, x_train[:, vol_column]) + 4 * x_train[:, session_column].astype(
-                int
-            )
-            test_group = np.searchsorted(boundaries, all_inputs[:, -1, vol_column]) + 4 * all_inputs[
-                :, -1, session_column
+            reference_train = calibration["reference_features"] if pvw_cache else x_train
+            reference_test = np.asarray(inputs_list)[:, -1]
+            boundaries = np.quantile(reference_train[:, vol_column], [0.25, 0.5, 0.75])
+            train_group = np.searchsorted(boundaries, reference_train[:, vol_column]) + 4 * reference_train[
+                :, session_column
+            ].astype(int)
+            test_group = np.searchsorted(boundaries, reference_test[:, vol_column]) + 4 * reference_test[
+                :, session_column
             ].astype(int)
             group_quantiles = np.stack(
-                [np.quantile(y_train[train_group == group], levels, axis=0).T for group in range(8)]
+                [
+                    np.quantile(y_train[train_group == group], levels, axis=0).T
+                    if np.any(train_group == group)
+                    else empirical[0]
+                    for group in range(8)
+                ]
             )
             probabilistic_baselines["volatility_session_empirical"] = group_quantiles[test_group]
         mean, scale = x_train.mean(0), x_train.std(0)
@@ -249,6 +266,12 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
         "model_minus_empirical_path_pinball_bp",
         "model_minus_empirical_h30_pinball_bp",
     ]
+    if previous_median is not None:
+        difference = (np.abs(median - truth) - np.abs(previous_median - truth)) / anchor[:, None] * 100
+        differences = np.column_stack((differences, difference.mean(-1), difference[:, -1]))
+        difference_columns.extend(
+            ("median_minus_previous_direct_path_mae_pct", "median_minus_previous_direct_h30_mae_pct")
+        )
     for key, reference in probabilistic_baselines.items():
         reference_error = target[..., None] - reference
         reference_difference = (

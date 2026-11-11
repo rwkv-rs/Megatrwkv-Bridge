@@ -323,3 +323,60 @@ def test_direct_quantile_training_defers_test_split_until_model_selection(prepar
     train, validation, test = config.build_datasets(SimpleNamespace(train_samples=2, valid_samples=2, test_samples=2))
     assert train is not None and validation is not None
     assert test is None
+
+
+def test_pvw_cache_matches_raw_ids_and_masks_final_batch(prepared, tmp_path):
+    from megatron.bridge.data.datasets.ohlcv import OHLCVQuantileWindowDataset, manifest_digest
+    from megatron.bridge.data.datasets.ohlcv_covariates import prepare_covariates
+
+    _, root = prepared
+    covariates = tmp_path / "covariates"
+    cache = tmp_path / "pvw"
+    prepare_covariates(root, covariates, workers=1)
+    instrument = json.loads((root / "manifest.json").read_text())["instruments"][0]["path"]
+    shard = cache / "train" / instrument
+    shard.mkdir(parents=True)
+    rows = np.arange(6, dtype=np.float32).reshape(2, 3)
+    np.save(shard / "values.npy", rows)
+    np.save(cache / "validation-indices.npy", [1])
+    np.save(cache / "validation-values.npy", rows[1:])
+    (cache / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_manifest_sha256": manifest_digest(root),
+                "covariates_sha256": manifest_digest(covariates),
+                "context": 3,
+                "horizon": 4,
+                "windows": {"train": 2, "validation": 2, "test": 2},
+                "columns": [0, 1, 2, 3, 4, 10],
+            }
+        )
+    )
+    dataset = OHLCVQuantileWindowDataset(
+        root,
+        split="train",
+        seq_length=3,
+        horizon=4,
+        epochs=1,
+        target_length=4,
+        seed=1234,
+        covariates=covariates,
+        pvw_cache=cache,
+    )
+    mixed = dataset.__getitems__([1, 3, 0, 2])
+    np.testing.assert_array_equal(mixed[0]["features"][:, -1], rows[dataset.raw_indices(np.array([1]))[0]])
+    np.testing.assert_array_equal(mixed[2]["features"][:, -1], rows[dataset.raw_indices(np.array([0]))[0]])
+    assert mixed[1]["features"].shape == (3, 7)
+    assert not mixed[1]["loss_mask"].any()
+    assert not mixed[3]["loss_mask"].any()
+    frozen = OHLCVQuantileWindowDataset(
+        root,
+        split="validation",
+        seq_length=3,
+        horizon=4,
+        covariates=covariates,
+        pvw_cache=cache,
+    )
+    np.testing.assert_array_equal(frozen[1]["features"][:, -1], rows[1])
+    with pytest.raises(ValueError, match="frozen PVW cache"):
+        frozen[0]

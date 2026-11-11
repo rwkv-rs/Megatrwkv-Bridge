@@ -604,3 +604,51 @@ All 71 related unit tests and all-file pre-commit checks passed. Strict mypy
 reported no errors in five of seven changed implementation files; model/recipe
 checking still reports inherited framework `Any` types and dependent return-type
 errors. The full check log is retained with the runtime artifacts.
+
+
+## Past-only PVW and L12D768
+
+The PVW experiment keeps the 64 completed bars, 30 future closes and nine
+quantiles of the direct-quantile task. It fits POA/VMD and XGBoost on training
+windows, then caches one 64-point denoised relative log-price sequence for
+every eligible stride-one training origin. The validation and test caches hold
+only frozen windows. Each VMD transform uses that origin's historical closes;
+the raw future closes remain the labels. The transform uses signed Pearson
+correlation 0.1 and three Haar levels with MAD/universal soft thresholding.
+
+Prepare the cache and train with the existing data, covariate and frozen
+window manifests:
+
+```bash
+timeout 48h uv run --no-sync --with xgboost-cpu==3.2.0 python -m torch.distributed.run \
+  --standalone --nproc_per_node=8 examples/models/rwkv7/forecast.py prepare-pvw \
+  --data "$FORECAST_DATA" --covariates "$FORECAST_COVARIATES" \
+  --validation-indices "$FORECAST_VALIDATION" --test-windows "$FORECAST_TEST" \
+  --batch-size "$PVW_BATCH" --output "$FORECAST_PVW"
+
+timeout 168h uv run --no-sync python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  examples/models/rwkv7/forecast.py train --task direct_quantile --epochs 1 \
+  --forecast-architecture cnn_rwkv_attention --config examples/models/rwkv7/forecast-l12-d768.json \
+  --data "$FORECAST_DATA" --covariates "$FORECAST_COVARIATES" --pvw-cache "$FORECAST_PVW" \
+  --validation-indices "$FORECAST_VALIDATION" --output "$FORECAST_RUN" \
+  --context 64 --forecast-horizon 30 --global-batch-size 12288 --micro-batch-size "$FORECAST_MICROBATCH" \
+  --learning-rate 1e-4 --warmup-steps 100 --eval-iters 1 --eval-interval 500 --save-interval 500 \
+  --seed 1234 --calibration-windows 4096 --normalize-inputs --head-gain 0.01 --head-fp32 --rwkv-optimizer
+
+timeout 1h uv run --no-sync python examples/models/rwkv7/forecast.py evaluate \
+  --checkpoint "$FORECAST_RUN/best-median-forecast.pt" --data "$FORECAST_DATA" \
+  --split test --horizon 30 --windows "$FORECAST_TEST" --direct-baseline-paths "$DIRECT_BASELINE" \
+  --output "$FORECAST_RUN/evaluation/metrics.json"
+```
+
+Retry a partially written cache with the same command and output directory.
+Completed instrument shards are reused. Resume training by adding
+`--resume "$FORECAST_RUN/checkpoints"` to the original command. The full-epoch
+direct-quantile mode masks the unused rows in the last global batch.
+
+For single-instrument inference, use `predict --market MARKET.npy`. The array
+contains the same-minute market return, volatility and up fraction aligned
+with the instrument Parquet rows. Supply the full contiguous session prefix
+through the prediction origin. The checkpoint carries the selected feature
+order and VMD parameters, and the CLI recomputes the exact window feature
+before predicting.

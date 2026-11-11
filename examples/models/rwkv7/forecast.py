@@ -91,6 +91,7 @@ def train(args: argparse.Namespace) -> None:
 
         hf.forecast_input_size = len(FORECAST_FEATURE_NAMES)
         hf.forecast_feature_names = list(FORECAST_FEATURE_NAMES)
+    reference_features = None
     if args.calibration_windows:
         import numpy as np
 
@@ -109,8 +110,15 @@ def train(args: argparse.Namespace) -> None:
         count = 0
         targets = []
         calibration_features = []
-        for i in range(args.calibration_windows):
-            sample = calibration[i * calibration.num_windows // args.calibration_windows]
+        indices = (
+            np.arange(args.calibration_windows, dtype=np.int64) * calibration.num_windows // args.calibration_windows
+        )
+        if pvw_cache:
+            reference_features = np.empty((len(indices), 23), dtype=np.float32)
+            for positions, _, starts, arrays, _ in calibration.iter_raw_windows(calibration.raw_indices(indices)):
+                reference_features[positions] = arrays["features"][starts + args.context - 1]
+        samples = calibration.__getitems__(indices.tolist()) if pvw_cache else (calibration[int(i)] for i in indices)
+        for sample in samples:
             mask = sample["loss_mask"].astype(bool)
             if direct:
                 targets.append(sample["labels"])
@@ -245,6 +253,7 @@ def train(args: argparse.Namespace) -> None:
                     args.output / "calibration.npz",
                     features=np.asarray(calibration_features),
                     targets=np.asarray(targets),
+                    **({"reference_features": reference_features} if reference_features is not None else {}),
                 )
             if args.fork_from:
                 (args.output / "fork.json").write_text(
@@ -602,6 +611,7 @@ def main() -> None:
     evaluation.add_argument("--max-windows", type=int, default=1000)
     evaluation.add_argument("--windows", type=Path, help="Frozen window identities from an earlier evaluation")
     evaluation.add_argument("--baseline-paths", type=Path, help="Earlier autoregressive prediction NPZ")
+    evaluation.add_argument("--direct-baseline-paths", type=Path, help="Earlier direct quantile prediction NPZ")
     evaluation.add_argument("--covariates", type=Path, help="Feature cache matching the checkpoint")
     evaluation.add_argument("--metrics-only", action="store_true", help="Skip large prediction arrays, CSV and plots")
     evaluation.add_argument("--pvw-cache", type=Path, help="PVW cache matching the checkpoint")
