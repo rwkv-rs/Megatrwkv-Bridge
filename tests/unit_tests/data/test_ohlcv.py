@@ -285,6 +285,18 @@ def test_prepared_covariates_keep_labels_and_frozen_indices(prepared, tmp_path):
     np.testing.assert_array_equal(augmented[0]["features"][:, :5], original[1]["features"])
     np.testing.assert_array_equal(augmented[0]["labels"], original[1]["labels"])
     np.testing.assert_array_equal(augmented[2]["features"], augmented[0]["features"])
+    columns = [0, 1, 2, 3, 4, 19]
+    selected = OHLCVQuantileWindowDataset(
+        root,
+        split="test",
+        seq_length=3,
+        horizon=4,
+        covariates=output,
+        window_indices=tmp_path / "indices.npy",
+        feature_columns=columns,
+    )
+    np.testing.assert_array_equal(selected[0]["features"], augmented[0]["features"][:, columns])
+    np.testing.assert_array_equal(selected[0]["labels"], augmented[0]["labels"])
 
 
 def test_stratified_window_selection_uses_all_stride_one_origins(prepared, tmp_path):

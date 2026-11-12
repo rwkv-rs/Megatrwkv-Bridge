@@ -19,6 +19,9 @@ from megatron.bridge.data.datasets.ohlcv import FEATURE_NAMES, manifest_digest
 
 
 logger = logging.getLogger(__name__)
+# Same-minute aggregates shared by every instrument. Their history identifies
+# the training-period timestamp, so forecast inputs exclude them.
+MARKET_FEATURE_NAMES = ("market_return", "market_volatility", "market_up_fraction")
 COVARIATE_NAMES = (
     "minute_sin",
     "minute_cos",
@@ -29,9 +32,7 @@ COVARIATE_NAMES = (
     *tuple(f"volatility_{n}" for n in (5, 15, 30, 60)),
     "relative_volume_60",
     "up_fraction_60",
-    "market_return",
-    "market_volatility",
-    "market_up_fraction",
+    *MARKET_FEATURE_NAMES,
 )
 FORECAST_FEATURE_NAMES = (*FEATURE_NAMES, *COVARIATE_NAMES)
 

@@ -168,7 +168,14 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
     ordered = np.sort(raw_array, axis=-1)
     levels = np.asarray(model.quantile_levels)
     target = 100 * np.log(truth / anchor[:, None])
+    # The calibrated head's initialization: training quantiles, rescaled by each
+    # window's volatility when the checkpoint predicts in volatility units.
     empirical = np.broadcast_to(np.asarray(payload["run"]["hf_config"]["forecast_target_quantiles"]), ordered.shape)
+    if model.volatility_floor is not None:
+        from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import forecast_window_scale
+
+        scale = forecast_window_scale(torch.from_numpy(all_inputs), floor=model.volatility_floor, horizon=horizon)
+        empirical = empirical * scale.numpy().astype(np.float64)[..., None]
     prices = anchor[:, None, None] * np.exp(ordered / 100)
     median = prices[..., int(np.argmin(abs(levels - 0.5)))]
     persistence = np.broadcast_to(anchor[:, None], truth.shape)
@@ -217,7 +224,7 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
                 [
                     np.quantile(y_train[train_group == group], levels, axis=0).T
                     if np.any(train_group == group)
-                    else empirical[0]
+                    else np.quantile(y_train, levels, axis=0).T
                     for group in range(8)
                 ]
             )

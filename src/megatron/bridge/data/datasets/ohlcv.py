@@ -428,11 +428,19 @@ def manifest_digest(root: Path) -> str:
 
 
 class OHLCVQuantileWindowDataset(OHLCVWindowDataset):
-    """Complete historical windows with future cumulative close-return labels."""
+    """Complete historical windows with future cumulative close-return labels.
 
-    def __init__(self, *args: Any, pvw_cache: Path | None = None, **kwargs: Any) -> None:
+    ``feature_columns`` selects covariate-cache columns for model input. When
+    omitted, PVW windows use the cache's selected columns and covariate windows
+    use every column, as recorded by checkpoints that predate the selection.
+    """
+
+    def __init__(
+        self, *args: Any, pvw_cache: Path | None = None, feature_columns: list[int] | None = None, **kwargs: Any
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.pvw_cache = pvw_cache
+        self.feature_columns = feature_columns
         self.pvw_metadata: dict[str, Any] | None = None
         self._pvw_selection: NDArray[np.int64] | None = None
         self._pvw_values: NDArray[np.float32] | None = None
@@ -451,6 +459,8 @@ class OHLCVQuantileWindowDataset(OHLCVWindowDataset):
             ):
                 raise ValueError("PVW cache does not match the source window inventory.")
             self.pvw_metadata = metadata
+            if self.feature_columns is None:
+                self.feature_columns = metadata["columns"]
             if self.split != "train":
                 self._pvw_selection = np.load(pvw_cache / f"{self.split}-indices.npy", mmap_mode="r")
                 self._pvw_values = np.load(pvw_cache / f"{self.split}-values.npy", mmap_mode="r")
@@ -503,13 +513,12 @@ class OHLCVQuantileWindowDataset(OHLCVWindowDataset):
             valid = valid[sampler_indices < self.num_windows * self.epochs]
         raw_indices = self.raw_indices(sampler_indices[valid])
         channels = len(FEATURE_NAMES)
-        if self.pvw_metadata is not None:
-            columns = self.pvw_metadata["columns"]
-            channels = len(columns) + 1
-        elif self.covariates is not None:
+        if self.covariates is not None and self.feature_columns is None:
             from megatron.bridge.data.datasets.ohlcv_covariates import FORECAST_FEATURE_NAMES
 
             channels = len(FORECAST_FEATURE_NAMES)
+        elif self.feature_columns is not None:
+            channels = len(self.feature_columns) + (self.pvw_metadata is not None)
         features = np.zeros((len(indices), self.seq_length, channels), dtype=np.float32)
         labels = np.zeros((len(indices), self.horizon), dtype=np.float32)
         mask = np.zeros_like(labels)
@@ -518,10 +527,12 @@ class OHLCVQuantileWindowDataset(OHLCVWindowDataset):
         for positions, _, starts, arrays, denoised in self.iter_raw_windows(raw_indices):
             rows = valid[positions]
             values = arrays["features"][starts[:, None] + history]
+            if self.feature_columns is not None:
+                values = values[..., self.feature_columns]
             if denoised is None:
                 features[rows] = values
             else:
-                features[rows, :, :-1] = values[..., columns]
+                features[rows, :, :-1] = values
                 features[rows, :, -1] = denoised
             anchor = arrays["close"][starts + self.seq_length - 1]
             labels[rows] = PRICE_SCALE * np.log(arrays["close"][starts[:, None] + future] / anchor[:, None])

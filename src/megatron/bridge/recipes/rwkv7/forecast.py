@@ -37,8 +37,6 @@ logger = logging.getLogger(__name__)
 class RWKV7ForecastOptimizerOverrides(OptimizerConfigOverrideProvider):
     """Match RWKV-LM's matrix-only decay and doubled decay-logit learning rate."""
 
-    apply_lr_bounds: bool = True
-
     def build_config_overrides(
         self, context: OptimizerConfigOverrideProviderContext
     ) -> dict[ParamKey, ParamGroupOverride]:
@@ -49,12 +47,11 @@ class RWKV7ForecastOptimizerOverrides(OptimizerConfigOverrideProvider):
             fn=lambda parameter, name: not (name.endswith(".weight") and parameter.squeeze().ndim >= 2),
         )
         overrides[ParamKey(with_name_predicate=no_decay)] = ParamGroupOverride(wd_mult=0.0)
-        overrides[ParamKey(name="*.linear_attn.w0")] = ParamGroupOverride(lr_mult=2.0)
-        if self.apply_lr_bounds:
-            overrides[ParamKey(name="*.linear_attn.w0")].update(
-                max_lr=2 * context.optimizer_config.lr,
-                min_lr=2 * context.optimizer_config.min_lr,
-            )
+        overrides[ParamKey(name="*.linear_attn.w0")] = ParamGroupOverride(
+            lr_mult=2.0,
+            max_lr=2 * context.optimizer_config.lr,
+            min_lr=2 * context.optimizer_config.min_lr,
+        )
         return overrides
 
 
@@ -64,13 +61,10 @@ class ForecastRun(TypedDict):
     hf_config: dict[str, Any]
     manifest_sha256: str
     steps: int
-    scheduler_decay_steps: NotRequired[int]
     epochs: int | None
     global_batch_size: int
     micro_batch_size: int
     learning_rate: float
-    learning_rate_scale: NotRequired[float]
-    optimizer_policy: NotRequired[str]
     warmup_steps: int
     save_interval: int
     eval_interval: int
@@ -85,8 +79,6 @@ class ForecastRun(TypedDict):
     validation_indices_sha256: NotRequired[str]
     pvw_cache: NotRequired[str]
     pvw_cache_sha256: NotRequired[str]
-    train_indices_sha256: NotRequired[str]
-    scheduler_max_steps: NotRequired[int]
     data_workers: NotRequired[int]
 
 
@@ -114,7 +106,7 @@ class OHLCVDatasetConfig(DatasetProvider):
     covariates: str | None = None
     validation_indices: str | None = None
     pvw_cache: str | None = None
-    train_indices: str | None = None
+    feature_columns: list[int] | None = None
 
     def build_datasets(
         self, context: DatasetBuildContext
@@ -123,7 +115,11 @@ class OHLCVDatasetConfig(DatasetProvider):
         datasets: list[OHLCVWindowDataset | None] = []
         direct = self.forecast_task == "direct_quantile"
         dataset_class = (
-            partial(OHLCVQuantileWindowDataset, pvw_cache=Path(self.pvw_cache) if self.pvw_cache else None)
+            partial(
+                OHLCVQuantileWindowDataset,
+                pvw_cache=Path(self.pvw_cache) if self.pvw_cache else None,
+                feature_columns=self.feature_columns,
+            )
             if direct
             else OHLCVWindowDataset
         )
@@ -148,9 +144,7 @@ class OHLCVDatasetConfig(DatasetProvider):
                     epochs=self.epochs if split == "train" else None,
                     cycle_length=self.evaluation_samples if split != "train" else None,
                     covariates=Path(self.covariates) if self.covariates else None,
-                    window_indices=Path(self.train_indices)
-                    if split == "train" and self.train_indices
-                    else Path(self.validation_indices)
+                    window_indices=Path(self.validation_indices)
                     if split == "validation" and self.validation_indices
                     else None,
                 )
@@ -178,7 +172,6 @@ def rwkv7_ohlcv_config(
     covariates: Path | None = None,
     validation_indices: Path | None = None,
     pvw_cache: Path | None = None,
-    train_indices: Path | None = None,
     data_workers: int | None = None,
 ) -> ConfigContainer:
     """Build continuous RWKV7 training with fixed, distributed holdout windows.
@@ -202,7 +195,7 @@ def rwkv7_ohlcv_config(
         covariates=str(covariates) if covariates else None,
         validation_indices=str(validation_indices) if validation_indices else None,
         pvw_cache=str(pvw_cache) if pvw_cache else None,
-        train_indices=str(train_indices) if train_indices else None,
+        feature_columns=getattr(hf_config, "forecast_feature_columns", None),
     )
     cfg.model.calculate_per_token_loss = True
     cfg.ddp.average_in_collective = False
@@ -267,15 +260,8 @@ def forecast_forward_step(
     labels = batch["labels"].cuda(non_blocking=True)
     levels = tuple(state.cfg.model.hf_config.get("forecast_quantiles", ()))
     price_error = None
-    if (
-        levels
-        and not model.training
-        and (
-            state.cfg.dataset.epochs is not None
-            or state.cfg.dataset.train_indices is not None
-            or "forecast_volatility_floor" in state.cfg.model.hf_config
-        )
-    ):
+    if levels and not model.training:
+        # Select models on return-unit scores, independent of training-loss scaling.
         predictions = model(features=features)
         output = forecast_pinball(predictions, labels, levels)
         median = predictions.sort(dim=-1).values[..., levels.index(0.5)]
@@ -291,28 +277,6 @@ def forecast_forward_step(
         quantile_levels=levels,
         price_error=price_error,
     )
-
-
-class ForecastOptimizerCallback(Callback):
-    """Rescale the native scheduler after loading the original optimizer groups.
-
-    Core identifies checkpoint groups by their configured LR bounds. Keeping
-    those bounds preserves Adam/master state and the RWKV-LM 1x/2x grouping.
-    The native scheduler persists the multiplier and applies it on every step.
-    """
-
-    def __init__(self, scale: float, *, rwkv_optimizer: bool) -> None:
-        self.scale, self.rwkv_optimizer = scale, rwkv_optimizer
-
-    def on_train_start(self, context: CallbackContext) -> None:
-        """Apply the requested multiplier at the restored sample cursor."""
-        if self.rwkv_optimizer:
-            for group in context.optimizer.param_groups:
-                if group["lr_mult"] == 2.0:
-                    group["max_lr"] = context.state.cfg.optimizer.lr * 2
-                    group["min_lr"] = context.state.cfg.optimizer.min_lr * 2
-        context.scheduler.step_lr_rescale_schedule = ((0, self.scale),)
-        context.scheduler.step(0)
 
 
 class ForecastExportCallback(Callback):

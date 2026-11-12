@@ -105,19 +105,9 @@ class RWKV7ForecastModel(RWKV7Model):
             else nn.Linear
         )
         self.output_projection = head(model_config.hidden_size, outputs, dtype=torch.bfloat16)
+        # Chronos-Bolt-style instance scaling: the head predicts quantiles in
+        # units of each window's historical close-return RMS times sqrt(h).
         self.volatility_floor = getattr(self.hf.config, "forecast_volatility_floor", None)
-        masked_features = tuple(getattr(self.hf.config, "forecast_masked_features", ()))
-        if masked_features:
-            self.register_buffer(
-                "input_feature_mask",
-                torch.tensor(
-                    [index in masked_features for index in range(self.input_size)],
-                    device=self.output_projection.weight.device,
-                ),
-                persistent=False,
-            )
-        else:
-            self.input_feature_mask = None
         self.normalize_inputs = hasattr(self.hf.config, "forecast_input_mean")
         if self.normalize_inputs:
             # Explicit BF16 storage matches native wrapping and standalone reload.
@@ -169,15 +159,14 @@ class RWKV7ForecastModel(RWKV7Model):
         Args:
             features: Encoded bars with shape ``[batch, time, 5]``.
             labels: Already shifted ``[batch, time, 5]`` next-bar features, or
-                ``[batch, horizon]`` cumulative close-return targets.
+                ``[batch, horizon]`` cumulative close-return targets. With volatility
+                scaling, quantile losses are computed in scaled units.
             return_channel_losses: Retain the channel or quantile dimension in losses.
             past_key_values: HF RWKV cache used only for autoregressive inference.
         """
         inputs = features.float()
         if self.normalize_inputs:
             inputs = (inputs - self.feature_mean.float()) / self.feature_std.float()
-        if self.input_feature_mask is not None:
-            inputs = inputs.masked_fill(self.input_feature_mask, 0)
         inputs = inputs.to(self.output_projection.weight.dtype)
         if self.feature_mixer is None:
             embeddings = self.input_projection(inputs)
@@ -195,11 +184,10 @@ class RWKV7ForecastModel(RWKV7Model):
             prediction = self.output_projection(state).view(-1, self.horizon, len(self.quantile_levels)).float()
             if self.volatility_floor is not None:
                 scale = forecast_window_scale(features, floor=self.volatility_floor, horizon=self.horizon)
-                if self.training and labels is not None:
-                    labels = labels.float() / scale
-                else:
-                    prediction = prediction * scale.unsqueeze(-1)
-            if labels is None:
+                if labels is None:
+                    return prediction * scale.unsqueeze(-1)
+                labels = labels.float() / scale
+            elif labels is None:
                 return prediction
             losses = forecast_pinball(prediction, labels, self.quantile_levels)
             return losses if return_channel_losses else losses.mean(-1)

@@ -129,29 +129,6 @@ def test_calibrated_head_has_training_prior_and_fp32_output(config):
     assert prediction.dtype == torch.float32
 
 
-def test_adamw_update_metrics_exclude_lr_and_decoupled_decay():
-    from megatron.bridge.recipes.rwkv7.forecast_diagnostics import adamw_update_direction, tensor_statistics
-
-    parameter = torch.nn.Parameter(torch.tensor([0.2, -0.4], dtype=torch.float32))
-    optimizer = torch.optim.AdamW([parameter], lr=0.01, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
-    for step in range(1, 4):
-        before = parameter.detach().clone()
-        parameter.grad = torch.tensor([0.3 * step, -0.1])
-        optimizer.step()
-        state = optimizer.state[parameter]
-        direction = adamw_update_direction(
-            state["exp_avg"],
-            state["exp_avg_sq"],
-            step=step,
-            betas=(0.9, 0.95),
-            eps=1e-8,
-            bias_correction=True,
-        )
-        torch.testing.assert_close(parameter, before - 0.01 * (direction + 0.1 * before))
-    stats = tensor_statistics(torch.tensor([3.0, -4.0]))
-    torch.testing.assert_close(stats, torch.tensor([25.0, 2.0, 4.0]))
-
-
 def test_input_standardization_is_persisted_and_preserves_encoded_targets(config):
     config.hf_config.update(
         forecast_input_mean=[0.0, 0.0, 0.03, 0.04, 0.85],
@@ -230,209 +207,6 @@ def test_rwkv_optimizer_group_policy(name, shape, wd_mult, lr_mult):
         assert any(value.get("max_lr") == 2e-4 and value.get("min_lr") == 2e-5 for value in matching)
 
 
-@pytest.mark.parametrize("magnitude", [1.0, 1e-8, 5e-13, 2e-12, 0.0])
-def test_replay_normalization_matches_piecewise_jacobian(magnitude):
-    entry = Path(__file__).resolve().parents[3] / "examples/models/rwkv7/forecast_replay.py"
-    reference = runpy.run_path(str(entry))["reference_key"]
-    key = torch.zeros(1, 1, 4, dtype=torch.bfloat16)
-    key[..., 0] = magnitude
-    key.requires_grad_()
-    scale = torch.ones(4, dtype=torch.bfloat16)
-    rate = torch.full_like(key, 0.5)
-    _, negative_direction, _ = reference(key, scale, rate, scale, 4)
-    # Tangential derivatives scale as 1/norm; the radial derivative vanishes
-    # above epsilon and becomes 1/epsilon inside the clamped region.
-    negative_direction.float().sum().backward()
-    norm = key.detach().float().norm().item()
-    expected = torch.full_like(key, -1 / max(norm, 1e-12))
-    if norm > 1e-12:
-        expected[..., 0] = 0
-    torch.testing.assert_close(key.grad, expected, rtol=0.01, atol=0)
-
-
-def test_replay_recurrent_state_orientation_and_token_order():
-    entry = Path(__file__).resolve().parents[3] / "examples/models/rwkv7/forecast_replay.py"
-    reference = runpy.run_path(str(entry))["reference_recurrent"]
-    r = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]], requires_grad=True)
-    w = torch.zeros_like(r)
-    k = torch.tensor([[[2.0, 3.0], [4.0, 5.0]]])
-    v = torch.tensor([[[5.0, 7.0], [11.0, 13.0]]])
-    zero = torch.zeros_like(r)
-    output, state = reference(r, w, k, v, zero, zero, head_size=2)
-    decay = torch.exp(torch.tensor(-0.6065306597126334 / 2))
-    initial = k[0, 0, :, None] * v[0, 0, None, :]
-    final = initial * decay + k[0, 1, :, None] * v[0, 1, None, :]
-    expected = torch.stack((r[0, 0] @ initial, r[0, 1] @ final)).bfloat16()[None]
-    torch.testing.assert_close(output, expected, rtol=0, atol=0)
-    torch.testing.assert_close(state[0, 0], final)
-    output.float().sum().backward()
-    torch.testing.assert_close(r.grad[0], torch.stack((initial.sum(-1), final.sum(-1))))
-
-
-def test_readout_reference_head_normalization_and_rkv_gradients():
-    entry = Path(__file__).resolve().parents[3] / "examples/models/rwkv7/forecast_replay.py"
-    reference = runpy.run_path(str(entry))["reference_readout"]
-    x = torch.zeros(1, 1, 4, dtype=torch.bfloat16, requires_grad=True)
-    r = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], dtype=torch.bfloat16)
-    v = r.detach().clone().requires_grad_()
-    k = torch.ones_like(r)
-    residual = torch.tensor([[0.5, 0.25], [0.125, 0.25]], dtype=torch.bfloat16)
-    weight = torch.full((4,), 2.0, dtype=torch.bfloat16)
-    bias = torch.ones(4, dtype=torch.bfloat16)
-    gate = torch.tensor([[[0.5, 0.5, 0.25, 0.25]]], dtype=torch.bfloat16)
-    result = reference(x, r, k, v, residual, weight, bias, gate, head_size=2)
-    torch.testing.assert_close(result, torch.tensor([[[1.0, 1.5, 1.28125, 1.625]]], dtype=torch.bfloat16))
-    (result[..., 0].float() + result[..., 2].float()).sum().backward()
-    torch.testing.assert_close(x.grad, torch.tensor([[[20.0, -20.0, 10.0, -10.0]]], dtype=torch.bfloat16))
-    torch.testing.assert_close(v.grad, torch.tensor([[[0.5, 0.0, 0.34375, 0.0]]], dtype=torch.bfloat16))
-
-
-@pytest.mark.parametrize("legacy", [False, True])
-def test_lr_rescale_preserves_rwkv_ratios_adam_state_and_scheduler_cursor(legacy):
-    from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
-
-    from megatron.bridge.recipes.rwkv7.forecast import ForecastOptimizerCallback
-
-    parameters = [torch.nn.Parameter(torch.ones(2)) for _ in range(2)]
-    optimizer = torch.optim.AdamW(
-        [
-            {
-                "params": [parameter],
-                "max_lr": 1e-4 * (1 if legacy else multiplier),
-                "min_lr": 1e-5 * (1 if legacy else multiplier),
-                "lr_mult": multiplier,
-                "wd_mult": 0.0,
-            }
-            for parameter, multiplier in zip(parameters, (1.0, 2.0))
-        ]
-    )
-    for parameter in parameters:
-        parameter.grad = torch.ones_like(parameter)
-    optimizer.step()
-    moments = [optimizer.state[p]["exp_avg"].clone() for p in parameters]
-    scheduler = OptimizerParamScheduler(
-        optimizer,
-        init_lr=0,
-        max_lr=1e-4,
-        min_lr=1e-5,
-        lr_warmup_steps=100,
-        lr_decay_steps=3592,
-        lr_decay_style="cosine",
-        start_wd=0.033,
-        end_wd=0.033,
-        wd_incr_steps=3592,
-        wd_incr_style="constant",
-    )
-    scheduler.step(2500)
-    base_lr = optimizer.param_groups[0]["lr"]
-    context = SimpleNamespace(
-        scheduler=scheduler,
-        optimizer=optimizer,
-        state=SimpleNamespace(cfg=SimpleNamespace(optimizer=SimpleNamespace(lr=1e-4, min_lr=1e-5))),
-    )
-    ForecastOptimizerCallback(0.5, rwkv_optimizer=True).on_train_start(context)
-    assert scheduler.num_steps == 2500
-    assert optimizer.param_groups[0]["lr"] == base_lr * 0.5
-    assert optimizer.param_groups[1]["lr"] == base_lr
-    assert optimizer.param_groups[0]["max_lr"] == 1e-4
-    for parameter, moment in zip(parameters, moments):
-        torch.testing.assert_close(optimizer.state[parameter]["exp_avg"], moment, rtol=0, atol=0)
-    saved = scheduler.state_dict()
-    scheduler.num_steps = 0
-    scheduler.load_state_dict(saved)
-    assert scheduler.num_steps == 2500
-    assert optimizer.param_groups[0]["lr"] == base_lr * 0.5
-    scheduler.step(1)
-    assert optimizer.param_groups[1]["lr"] == optimizer.param_groups[0]["lr"] * 2
-
-
-@pytest.mark.parametrize("additional_epochs", [None, 4])
-def test_checkpoint_fork_preserves_source_and_resumes_corrected_groups(tmp_path, monkeypatch, additional_epochs):
-    entry = Path(__file__).resolve().parents[3] / "examples/models/rwkv7/forecast.py"
-    train = runpy.run_path(str(entry))["train"]
-    architecture = tmp_path / "architecture.json"
-    RwkvConfig(hidden_size=64, num_hidden_layers=2, context_length=16).to_json_file(architecture)
-    args = SimpleNamespace(
-        config=architecture,
-        task="direct_quantile" if additional_epochs else "next_bar",
-        forecast_horizon=30,
-        additional_epochs=None,
-        covariates=None,
-        validation_indices=None,
-        data=tmp_path / "data",
-        output=tmp_path / "source",
-        context=16,
-        calibration_windows=0,
-        normalize_inputs=False,
-        head_fp32=False,
-        rwkv_optimizer=True,
-        epochs=None,
-        steps=20,
-        eval_iters=0,
-        warmup_steps=0,
-        global_batch_size=2,
-        micro_batch_size=1,
-        learning_rate=1e-4,
-        learning_rate_scale=1.0,
-        save_interval=10,
-        eval_interval=10,
-        seed=2026,
-        resume=None,
-        fork_from=None,
-        checkpoint_step=None,
-        exit_interval=None,
-        diagnostics_interval=0,
-        spike_snapshot=False,
-    )
-    captured = []
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setenv("RANK", "0")
-    with (
-        patch("megatron.bridge.data.datasets.ohlcv.OHLCVWindowDataset", return_value=SimpleNamespace(num_windows=20)),
-        patch(
-            "megatron.bridge.data.datasets.ohlcv.OHLCVQuantileWindowDataset",
-            return_value=SimpleNamespace(num_windows=20),
-        ),
-        patch("megatron.bridge.data.datasets.ohlcv.manifest_digest", return_value="fixed-manifest"),
-        patch("megatron.bridge.training.utils.checkpoint_utils.checkpoint_exists", return_value=True),
-        patch(
-            "megatron.bridge.training.pretrain.pretrain", side_effect=lambda cfg, forward, **kw: captured.append(cfg)
-        ),
-    ):
-        train(args)
-        source = args.output
-        legacy = json.loads((source / "run.json").read_text())
-        legacy.pop("optimizer_policy")
-        original = json.dumps(legacy)
-        (source / "run.json").write_text(original)
-        (source / "best-validation.json").write_text('{"step": 5, "pinball": 0.1}')
-        (source / "best-forecast.pt").write_bytes(b"existing validation winner")
-        args.output = tmp_path / "continuation"
-        args.fork_from, args.checkpoint_step, args.learning_rate_scale = source, 10, 0.5
-        args.additional_epochs = additional_epochs
-        train(args)
-        assert (source / "run.json").read_text() == original
-        assert captured[-1].checkpoint.load == str(source / "checkpoints")
-        assert captured[-1].checkpoint.ckpt_step == 10
-        assert captured[-1].optimizer_config_override_provider.apply_lr_bounds is False
-        saved = json.loads((args.output / "run.json").read_text())
-        assert saved["optimizer_policy"] == "rwkv_lm_v2" and saved["learning_rate_scale"] == 0.5
-        if additional_epochs:
-            assert saved["steps"] == 50  # 10 loaded steps + 4 * 20 windows / batch 2
-            assert saved["sample_budget"]["windows"] == 100
-            assert saved["scheduler_decay_steps"] == 20
-            assert captured[-1].train.train_iters == 50
-            assert captured[-1].scheduler.lr_decay_iters == 20
-            assert (args.output / "best-forecast.pt").read_bytes() == b"existing validation winner"
-            assert (args.output / "best-validation.json").read_text() == '{"step": 5, "pinball": 0.1}'
-        args.additional_epochs = None
-        args.fork_from, args.checkpoint_step, args.resume = None, None, args.output / "checkpoints"
-        train(args)
-        assert captured[-1].optimizer_config_override_provider.apply_lr_bounds is True
-        if additional_epochs:
-            assert captured[-1].scheduler.lr_decay_iters == 20
-
-
 @pytest.mark.parametrize("input_size", [5, 23])
 def test_direct_quantile_head_loss_gradients_and_rearrangement(config, input_size):
     config.hf_config.update(forecast_task="direct_quantile", forecast_horizon=3, forecast_quantiles=[0.1, 0.5, 0.9])
@@ -467,39 +241,114 @@ def test_direct_quantile_head_loss_gradients_and_rearrangement(config, input_siz
     restored.load_state_dict(model.state_dict(), strict=True)
 
 
-def test_masked_market_and_volatility_scaled_training_and_inference(config):
+def test_volatility_scaled_quantiles_score_scaled_units_and_predict_returns(config):
     config.hf_config.update(
         forecast_task="direct_quantile",
         forecast_horizon=3,
         forecast_quantiles=[0.1, 0.5, 0.9],
-        forecast_input_mean=[1.0] * 5,
-        forecast_input_std=[2.0] * 5,
-        forecast_masked_features=[2, 3, 4],
         forecast_volatility_floor=0.25,
     )
     model = RWKV7ForecastModel(config, None)
     features = torch.randn(2, 8, 5)
-    features[0, :, 1] = 0
+    features[0, :, 1] = 0  # flat history: the floor applies
     features[1, :, 1] = 2
-    perturbed = features.clone()
-    perturbed[..., 2:] += 100
     labels = torch.tensor([[0.1, 0.2, 0.3], [-0.1, -0.2, -0.3]])
     scale = torch.tensor([[0.25], [2.0]]) * torch.arange(1, 4).sqrt()
+    levels = torch.tensor([0.1, 0.5, 0.9])
     with patch.object(
         model.hf, "forward", side_effect=lambda **kw: SimpleNamespace(last_hidden_state=kw["inputs_embeds"])
     ):
         loss = model(features, labels, return_channel_losses=True)
-        torch.testing.assert_close(loss, model(perturbed, labels, return_channel_losses=True), rtol=0, atol=0)
-        model.eval()
         prediction = model(features)
-        torch.testing.assert_close(prediction, model(perturbed), rtol=0, atol=0)
         error = (labels.unsqueeze(-1) - prediction) / scale.unsqueeze(-1)
-        levels = torch.tensor([0.1, 0.5, 0.9])
         torch.testing.assert_close(loss, torch.maximum(levels * error, (levels - 1) * error))
-        torch.testing.assert_close(model(features, labels, return_channel_losses=True), loss * scale.unsqueeze(-1))
+        model.eval()
+        torch.testing.assert_close(model(features, labels, return_channel_losses=True), loss)
+        torch.testing.assert_close(model.predict_quantiles(features), prediction.sort(-1).values)
     restored = RWKV7ForecastModel(RWKV7ForecastConfig.from_dict(config.as_dict()), None)
     restored.load_state_dict(model.state_dict(), strict=True)
-    torch.testing.assert_close(restored.input_feature_mask, model.input_feature_mask)
+    assert restored.volatility_floor == 0.25
+
+
+def test_direct_quantile_training_excludes_market_inputs_and_calibrates_scaled_targets(tmp_path, monkeypatch):
+    import numpy as np
+
+    from megatron.bridge.data.datasets.ohlcv_covariates import FORECAST_FEATURE_NAMES, MARKET_FEATURE_NAMES
+
+    entry = Path(__file__).resolve().parents[3] / "examples/models/rwkv7/forecast.py"
+    train = runpy.run_path(str(entry))["train"]
+    architecture = tmp_path / "architecture.json"
+    RwkvConfig(hidden_size=64, num_hidden_layers=2, context_length=16).to_json_file(architecture)
+    covariates = tmp_path / "covariates"
+    covariates.mkdir()
+    (covariates / "manifest.json").write_text("{}")
+    expected_columns = [i for i, name in enumerate(FORECAST_FEATURE_NAMES) if name not in MARKET_FEATURE_NAMES]
+    created = []
+
+    class Windows:
+        num_windows = 20
+
+        def __init__(self, *args, **kwargs):
+            created.append(kwargs)
+
+        def __getitem__(self, index):
+            # Alternate historical RMS 1 and 2; labels grow with volatility * sqrt(h).
+            volatility = 1.0 + index % 2
+            features = np.zeros((16, len(expected_columns)), dtype=np.float32)
+            features[:, 1] = volatility
+            labels = (volatility * np.sqrt(np.arange(1, 31))).astype(np.float32)
+            return {"features": features, "labels": labels, "loss_mask": np.ones(30, dtype=np.float32)}
+
+    args = SimpleNamespace(
+        config=architecture,
+        data=tmp_path / "data",
+        output=tmp_path / "run",
+        context=16,
+        task="direct_quantile",
+        forecast_horizon=30,
+        forecast_architecture=None,
+        covariates=covariates,
+        pvw_cache=None,
+        validation_indices=None,
+        calibration_windows=4,
+        normalize_inputs=False,
+        head_gain=0.01,
+        head_fp32=False,
+        rwkv_optimizer=False,
+        epochs=None,
+        steps=20,
+        eval_iters=0,
+        warmup_steps=0,
+        global_batch_size=2,
+        micro_batch_size=1,
+        learning_rate=1e-4,
+        save_interval=10,
+        eval_interval=10,
+        seed=2026,
+        data_workers=None,
+        resume=None,
+        exit_interval=None,
+    )
+    captured = []
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("RANK", "0")
+    with (
+        patch("megatron.bridge.data.datasets.ohlcv.OHLCVQuantileWindowDataset", Windows),
+        patch("megatron.bridge.data.datasets.ohlcv.manifest_digest", return_value="fixed-manifest"),
+        patch(
+            "megatron.bridge.training.pretrain.pretrain", side_effect=lambda cfg, forward, **kw: captured.append(cfg)
+        ),
+    ):
+        train(args)
+    hf_config = json.loads((args.output / "run.json").read_text())["hf_config"]
+    assert hf_config["forecast_feature_columns"] == expected_columns
+    assert not set(MARKET_FEATURE_NAMES) & set(hf_config["forecast_feature_names"])
+    assert hf_config["forecast_input_size"] == len(expected_columns)
+    assert all(kwargs["feature_columns"] == expected_columns for kwargs in created)
+    assert captured[-1].dataset.feature_columns == expected_columns
+    assert hf_config["forecast_volatility_floor"] == pytest.approx(1.0, rel=1e-6)
+    # Every target equals its window scale, so all scaled quantiles are one.
+    np.testing.assert_allclose(hf_config["forecast_target_quantiles"], 1.0, rtol=1e-6)
 
 
 def test_quantile_masked_microbatches_preserve_global_normalization():

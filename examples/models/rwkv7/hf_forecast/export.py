@@ -32,6 +32,13 @@ def main() -> None:
     backbone = payload["run"]["hf_config"]
     if backbone.get("forecast_task") != "direct_quantile":
         raise ValueError("Export requires a direct_quantile checkpoint.")
+    # The standalone model implements the published linear, all-covariate head only.
+    unsupported = sorted(
+        {"forecast_architecture", "forecast_pvw", "forecast_feature_columns", "forecast_volatility_floor"}
+        & backbone.keys()
+    )
+    if unsupported:
+        raise ValueError(f"The standalone package does not implement {unsupported}.")
     args.output.mkdir(parents=True, exist_ok=False)
     RWKV7ForecastConfig.register_for_auto_class("AutoConfig")  # type: ignore[no-untyped-call]  # HF registration hook.
     RWKV7ForQuantileForecasting.register_for_auto_class("AutoModel")  # type: ignore[no-untyped-call]  # HF registration hook.

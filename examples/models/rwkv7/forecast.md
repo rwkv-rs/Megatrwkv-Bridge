@@ -175,46 +175,9 @@ evaluator to assess accumulated rollout error. The prepared manifest must match
 the training run. Source data covers A-share equities; ETF data is published
 separately by the dataset author.
 
-## Stability diagnostics
+## Initialization and optimizer
 
-Add `--diagnostics-interval 10` to native training to record global, layer and
-module statistics under `forecast/` in TensorBoard and in `diagnostics.jsonl`.
-The callback observes native AdamW without changing gradients or optimizer steps.
-The sensitive TimeMix `k_a`, `k_k` and `w0` parameters also have individual groups,
-so their parameter and gradient scales are not hidden by module-wide aggregates.
-It records parameter and gradient L2 norms, RMS and absolute maxima; raw gradients
-are reconstructed from the native clipping coefficient. Both the pre-clipping
-gradient norm and the post-clipping norm are retained. FP32 master-weight
-snapshots provide actual parameter changes (`delta_*`) and relative updates.
-`update_*` describes the bias-corrected AdamW direction computed directly from
-the optimizer's FP32 first and second moments and epsilon, excluding learning
-rate and decoupled weight decay. Actual `delta_*` includes FP32 master-weight
-rounding, rather than BF16 model-copy rounding.
-DP optimizer shards are counted once, and absolute maxima use MAX reductions.
-
-Forward hooks record hidden RMS and absmax at each block, TimeMix and ChannelMix
-output, including padded tail positions. These are reduced across DP ranks.
-RWKV does not produce softmax attention logits or attention entropy. The native
-loss logger additionally reports all five OHLCV channel losses with the same
-valid-position mask and denominator as the overall loss.
-
-The callback logs periodic samples plus events whose raw gradient norm exceeds
-five times the preceding 100-step median or whose loss exceeds 1.2 times that
-median. These event rules trigger recording, not clipping or skipped updates.
-The parameter RMS mean-field reference follows the dynamic approximation in
-[AdamW Weight RMS, part 2](https://kexue.fm/archives/11404):
-`q_t = (1 - lr_t * wd_t)^2 * q_(t-1) + lr_t^2`, initialized from actual parameter
-mean squares. It is an approximate reference under the article's assumptions,
-not a target for every RWKV parameter. Decay-free parameters have no finite
-constant-LR stationary RMS.
-
-`--spike-snapshot` additionally saves `spike-before.pt` at the first detected
-event. It contains the exact BF16 model weights used before that optimizer step,
-the training configuration and the consumed-sample cursor. This allows a
-single-batch numerical investigation without relying on a nearby periodic
-checkpoint. It requires diagnostics and preserves an existing snapshot on resume.
-
-For a separately validated initialization experiment, add
+Add
 `--calibration-windows 4096 --head-gain 0.01 --head-fp32`. Calibration uses only
 training windows, initializes the input projection and its constant direction
 jointly and orthogonally in FP32 before BF16 rounding, and gives the output head
@@ -245,84 +208,6 @@ This follows [`train_temp`'s `configure_optimizers` and callback](https://github
 as `forecast_optimizer` and must be evaluated in a separate run because it
 changes optimizer groups and training semantics.
 
-New runs additionally record `optimizer_policy=rwkv_lm_v2` in `run.json`.
-Resuming an older run preserves that run's original policy. To apply the
-corrected scheduler bounds to an older checkpoint, create a separate continuation
-with `--fork-from SOURCE_RUN --checkpoint-step STEP`. The loader constructs the
-source parameter groups, restores the FP32 master weights and Adam moments, then
-applies the requested policy before the first training update. Subsequent native
-checkpoints preserve the corrected groups for normal `--resume`.
-
-`--learning-rate-scale 0.5` multiplies the native scheduler's output uniformly,
-preserving the RWKV-LM 1x/2x ratios, schedule position, and checkpoint parameter
-group identities. Keep `--learning-rate` at the source run's value when forking.
-All data, model, batch, seed, and original training-horizon settings must match;
-the continuation permits changes to the scale and optimizer policy. `fork.json`
-records the source configuration and checkpoint iteration.
-
-For example, continue an existing one-epoch experiment from iteration 2500 and
-stop at iteration 2750 while retaining its full learning-rate schedule:
-
-```bash
-timeout 1h uv run --no-sync python -m torch.distributed.run --standalone --nproc_per_node=8 \
-  examples/models/rwkv7/forecast.py train \
-  --config examples/models/rwkv7/forecast-l24-d256.json \
-  --data DATA/ashare-ohlcv --output runs/ashare-continuation \
-  --fork-from runs/ashare-source --checkpoint-step 2500 \
-  --epochs 1 --context 64 --global-batch-size 12288 --micro-batch-size 512 \
-  --learning-rate 1e-4 --learning-rate-scale 0.5 --warmup-steps 100 \
-  --save-interval 500 --eval-interval 500 --eval-iters 10 --exit-interval 2750 \
-  --calibration-windows 4096 --head-gain 0.01 --head-fp32 --normalize-inputs \
-  --rwkv-optimizer --diagnostics-interval 10 --spike-snapshot
-```
-
-The callback also writes `steps.jsonl` with loss and pre-clipping gradient norm
-at every step. It reloads the preceding history on resume so the 100-step spike
-window continues across checkpoint boundaries.
-
-### Exact spike replay
-
-Replay a captured global batch on one GPU, retaining the original rank and
-microbatch order and accumulating parameter gradients in FP32:
-
-```bash
-timeout 10m uv run --no-sync python examples/models/rwkv7/forecast_replay.py \
-  --snapshot runs/ashare-continuation/spike-before.pt \
-  --data DATA/ashare-ohlcv --check-recurrent \
-  --output runs/ashare-continuation/spike-replay.json
-```
-
-The report includes per-head key-norm distributions for valid and padded
-positions, raw-key and normalized-direction gradient contributions, their
-alignment, and fused-versus-reference forward/backward differences. The optional
-recurrent comparison checks output, final FP32 state, and gradients of all six
-inputs on a captured sample. A companion `.pt` stores that sample's operator
-inputs and upstream gradients. `--reference-key` replaces only the selected
-layer's key preparation; `--batch-step` selects another batch at fixed weights.
-
-The snapshot also retains the pre-update FP32 master weights and key-projection
-Adam moments and records the actual key updates. `spike-previous.pt` retains the
-adjacent step with its original data cursor. Compare both weight points on the
-same batch before attributing a large parameter gradient to that parameter's
-own update. For example, replace the preceding layers while keeping the spike
-batch and the remaining spike weights:
-
-```bash
-timeout 10m uv run --no-sync python examples/models/rwkv7/forecast_replay.py \
-  --snapshot runs/ashare-continuation/spike-before.pt \
-  --weights-from runs/ashare-continuation/spike-previous.pt \
-  --replace-parameter 'hf.layers.[0-5].*' \
-  --data DATA/ashare-ohlcv --microbatches 1 \
-  --output runs/ashare-continuation/previous-upstream.json
-```
-
-Omit `--replace-parameter` to substitute all weights, or repeat it for multiple
-groups. The report records the exact replaced parameter names. Use
-`master_state_dict` for interpolation along an optimizer update, casting each
-intermediate weight point to the original model dtype. BF16 endpoint
-interpolation synchronizes one-ULP changes at the midpoint and distorts the
-measured update path.
-
 ## Validation commands
 
 ```bash
@@ -350,12 +235,24 @@ Independent windows reset recurrent state. Each label is
 `100 * log(future_close / last_context_close)`. Prices are recovered separately
 at each horizon as `last_context_close * exp(prediction / 100)`.
 
-The FP32 loss is standard pinball loss, averaged across quantiles and normalized
-across valid future positions using native Bridge DP/microbatch counts. Only
-complete context-plus-horizon windows enter this task. Use a fixed step budget;
-the next-bar epoch/tail semantics apply to the original task. Calibration uses
-training windows only, initializing each horizon/quantile bias from its empirical
-quantile and estimating historical input statistics separately.
+Following Chronos-Bolt's per-window scaling, the head predicts quantiles in units
+of `s_h = max(RMS_64(close_return), s_min) * sqrt(h)`, where `RMS_64` is computed
+from the window's 64 raw encoded close returns. Training uses the FP32 standard
+pinball loss of `labels / s_h`, averaged across quantiles and normalized across
+valid future positions using native Bridge DP/microbatch counts; inference
+multiplies the outputs by `s_h`. Fixed-unit quantiles cannot widen when realized
+volatility rises: the 2024 `q10-q90` span of 30-minute returns was 164 bp versus
+106 bp in 2023, and the unscaled L12D768 head narrowed its intervals while its
+80% coverage fell to 61%. Validation and the exported best checkpoints are
+scored on returns, independent of the training scale.
+
+Direct quantile training requires `--calibration-windows`. Calibration uses
+training windows only: `s_min` is the 5th percentile of their positive
+`RMS_64`, and each horizon/quantile bias starts from the empirical quantile of
+the scaled labels, so the initial model is the volatility-scaled empirical
+forecast. Historical input statistics are estimated separately. Only complete
+context-plus-horizon windows enter this task. Use a fixed step budget; the
+next-bar epoch/tail semantics apply to the original task.
 
 ```bash
 timeout 8h uv run --no-sync python -m torch.distributed.run --standalone --nproc_per_node=8 \
@@ -367,7 +264,7 @@ timeout 8h uv run --no-sync python -m torch.distributed.run --standalone --nproc
   --global-batch-size 12288 --micro-batch-size 768 --learning-rate 1e-4 \
   --save-interval 500 --eval-interval 500 --eval-iters 1 --seed 1234 \
   --calibration-windows 4096 --head-gain 0.01 --head-fp32 --normalize-inputs \
-  --rwkv-optimizer --diagnostics-interval 10
+  --rwkv-optimizer
 ```
 
 `best-forecast.pt` stores the earliest checkpoint with the lowest fixed-window
@@ -375,19 +272,6 @@ validation pinball loss; `best-validation.json` records its score and step.
 `forecast.pt` stores the last training weights. Native checkpoints retain the
 optimizer, scheduler, RNG and consumed-sample state for resume. New task settings
 and calibration statistics are persisted with the weights.
-
-To continue a direct quantile run for complete passes over its stride-1 training
-windows, replace `--steps` with `--additional-epochs 4`, supply
-`--fork-from SOURCE_RUN --checkpoint-step 3592`, and choose a new output directory.
-Keep the source model, calibration, data, batch and validation arguments identical.
-The final iteration is the loaded iteration plus
-`ceil(additional_epochs * training_windows / global_batch_size)`. The source
-learning-rate decay budget remains unchanged, so continuation after its decay
-endpoint uses the minimum learning rate without restarting warmup. Native Adam,
-RNG and consumed-sample state are restored. Earlier validation winners are copied
-into the new run and remain selected until a continuation checkpoint improves.
-Resume the continuation using its resolved `--steps` and `--resume`; the original
-decay budget is persisted in `run.json`.
 
 Direct inference returns `[batch, horizon, quantile]` scaled cumulative returns.
 `predict_quantiles(..., fix_quantile_crossing=False)` returns raw outputs;
@@ -413,7 +297,8 @@ timeout 1h uv run --no-sync python examples/models/rwkv7/forecast.py evaluate \
 The report includes raw quantile crossing, raw/sorted pinball loss, calibration,
 60% and 80% coverage, width and interval score, price and return errors,
 stock/date groups and a symbol-block bootstrap against last-close persistence.
-An empirical training-quantile baseline reuses the calibration sample. Eight
+The empirical baseline is the calibrated initialization: training quantiles,
+rescaled by each window's `s_h` for volatility-scaled checkpoints. Eight
 illustrative windows are selected by seed before inference; separate P10/P50/P90
 error examples explicitly describe their selection. Figures display actual
 historical/future close prices, the forecast origin, the median and marginal
@@ -493,6 +378,17 @@ calculation resets at the source segment, including session and split boundaries
 The market universe is the source manifest's instrument inventory. Only completed
 bars at the input timestamp enter its aggregate. The cache manifest records the
 source digest, feature order and temporal contract.
+
+Training excludes the three market aggregates from model input and records the
+remaining cache columns as `forecast_feature_columns`. Every instrument shares
+these values at a minute, so their 64-minute history identifies a training-period
+timestamp, and that timestamp's market move is part of thousands of labels. The
+L12D768 run learned it: at step 7,500 the cross-sectional mean prediction had a
+0.920 correlation with the realized 30-stock mean return on 2023 training dates,
+0.035 after replacing only the market inputs with another day's, and 0.061 on
+2024. Removing the cross-sectional mean prediction eliminated 89% of its
+2023 WIS gain over step 500. The cache retains the columns so existing PVW
+caches remain valid.
 
 ```bash
 timeout 90m uv run --no-sync python examples/models/rwkv7/forecast.py prepare-covariates \
@@ -646,9 +542,9 @@ Completed instrument shards are reused. Resume training by adding
 `--resume "$FORECAST_RUN/checkpoints"` to the original command. The full-epoch
 direct-quantile mode masks the unused rows in the last global batch.
 
-For single-instrument inference, use `predict --market MARKET.npy`. The array
-contains the same-minute market return, volatility and up fraction aligned
-with the instrument Parquet rows. Supply the full contiguous session prefix
-through the prediction origin. The checkpoint carries the selected feature
-order and VMD parameters, and the CLI recomputes the exact window feature
-before predicting.
+For single-instrument inference, supply the full contiguous session prefix
+through the prediction origin. The checkpoint carries its input columns and VMD
+parameters, and the CLI recomputes the exact window feature before predicting.
+Checkpoints trained before the market inputs were removed also require
+`predict --market MARKET.npy`, containing the same-minute market return,
+volatility and up fraction aligned with the instrument Parquet rows.

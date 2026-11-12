@@ -12,7 +12,6 @@ import json
 import logging
 import math
 import os
-import shutil
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -50,7 +49,6 @@ def train(args: argparse.Namespace) -> None:
     from megatron.bridge.data.datasets.ohlcv import OHLCVQuantileWindowDataset, OHLCVWindowDataset, manifest_digest
     from megatron.bridge.recipes.rwkv7.forecast import (
         ForecastExportCallback,
-        ForecastOptimizerCallback,
         ForecastRun,
         forecast_forward_step,
         rwkv7_ohlcv_config,
@@ -58,56 +56,56 @@ def train(args: argparse.Namespace) -> None:
     from megatron.bridge.training.pretrain import pretrain
     from megatron.bridge.training.utils.checkpoint_utils import checkpoint_exists
 
-    additional_epochs = getattr(args, "additional_epochs", None)
     hf = RwkvConfig.from_json_file(args.config)
     hf.context_length = args.context
     # Forecasting starts from scratch and discards the language embedding/head.
     hf.vocab_size = 1
     hf.tie_word_embeddings = False
-    direct = getattr(args, "task", "next_bar") == "direct_quantile"
-    pvw_cache = getattr(args, "pvw_cache", None)
-    architecture = getattr(args, "forecast_architecture", None)
-    data_workers = getattr(args, "data_workers", None)
-    train_indices = getattr(args, "train_indices", None)
-    scale_volatility = getattr(args, "scale_volatility", False)
-    scheduler_max_steps = getattr(args, "scheduler_max_steps", None)
-    dataset_class = (
-        partial(OHLCVQuantileWindowDataset, covariates=args.covariates, pvw_cache=pvw_cache)
-        if direct
-        else OHLCVWindowDataset
-    )
-    if architecture is not None:
-        hf.forecast_architecture = architecture
+    direct = args.task == "direct_quantile"
+    pvw_cache = args.pvw_cache
+    if args.forecast_architecture is not None:
+        hf.forecast_architecture = args.forecast_architecture
     if direct:
         hf.forecast_task = "direct_quantile"
         hf.forecast_horizon = args.forecast_horizon
         hf.forecast_quantiles = [i / 10 for i in range(1, 10)]
-    if pvw_cache:
-        metadata = json.loads((pvw_cache / "manifest.json").read_text())
-        hf.forecast_input_size = len(metadata["feature_names"])
-        hf.forecast_feature_names = metadata["feature_names"]
-        hf.forecast_pvw = {key: metadata[key] for key in ("modes", "alpha", "columns")}
-        if metadata["validation_indices_sha256"] != hashlib.sha256(args.validation_indices.read_bytes()).hexdigest():
-            raise ValueError("Validation indices do not match the PVW cache.")
-    elif args.covariates:
-        from megatron.bridge.data.datasets.ohlcv_covariates import FORECAST_FEATURE_NAMES
+    if args.covariates:
+        from megatron.bridge.data.datasets.ohlcv_covariates import FORECAST_FEATURE_NAMES, MARKET_FEATURE_NAMES
 
-        hf.forecast_input_size = len(FORECAST_FEATURE_NAMES)
-        hf.forecast_feature_names = list(FORECAST_FEATURE_NAMES)
-    if getattr(args, "mask_market_inputs", False):
-        hf.forecast_masked_features = [
-            hf.forecast_feature_names.index(name)
-            for name in ("market_return", "market_volatility", "market_up_fraction")
+        source_columns = list(range(len(FORECAST_FEATURE_NAMES)))
+        if pvw_cache:
+            metadata = json.loads((pvw_cache / "manifest.json").read_text())
+            if (
+                metadata["validation_indices_sha256"]
+                != hashlib.sha256(args.validation_indices.read_bytes()).hexdigest()
+            ):
+                raise ValueError("Validation indices do not match the PVW cache.")
+            hf.forecast_pvw = {key: metadata[key] for key in ("modes", "alpha", "columns")}
+            source_columns = metadata["columns"]
+        # Market aggregates are shared by every instrument at a minute; models
+        # memorized training-period market moves from them and lost the gain
+        # out of sample, so they never enter the model.
+        hf.forecast_feature_columns = [
+            i for i in source_columns if FORECAST_FEATURE_NAMES[i] not in MARKET_FEATURE_NAMES
         ]
+        hf.forecast_feature_names = [FORECAST_FEATURE_NAMES[i] for i in hf.forecast_feature_columns]
+        if pvw_cache:
+            hf.forecast_feature_names.append(metadata["feature_names"][-1])
+        hf.forecast_input_size = len(hf.forecast_feature_names)
+    dataset_class = (
+        partial(
+            OHLCVQuantileWindowDataset,
+            covariates=args.covariates,
+            pvw_cache=pvw_cache,
+            feature_columns=getattr(hf, "forecast_feature_columns", None),
+        )
+        if direct
+        else OHLCVWindowDataset
+    )
     reference_features = None
-    if train_indices or args.calibration_windows:
+    if args.calibration_windows:
         import numpy as np
 
-    if train_indices:
-        selection = np.load(train_indices, mmap_mode="r", allow_pickle=False)
-        if selection.shape != (args.steps * args.global_batch_size,) or selection.dtype != np.dtype("int64"):
-            raise ValueError("Training selection must contain one int64 window ID per scheduled sample.")
-    if args.calibration_windows:
         calibration = dataset_class(
             args.data,
             split="train",
@@ -116,7 +114,6 @@ def train(args: argparse.Namespace) -> None:
             stride=1 if direct else args.context,
             keep_tail=not direct,
             seed=args.seed,
-            window_indices=train_indices,
         )
         total, feature_total, feature_squares = (
             np.zeros(getattr(hf, "forecast_input_size", 5), dtype=np.float64) for _ in range(3)
@@ -125,8 +122,9 @@ def train(args: argparse.Namespace) -> None:
         targets = []
         calibration_features = []
         volatility_features = []
-        calibration_pool = len(selection) if train_indices else calibration.num_windows
-        indices = np.arange(args.calibration_windows, dtype=np.int64) * calibration_pool // args.calibration_windows
+        indices = (
+            np.arange(args.calibration_windows, dtype=np.int64) * calibration.num_windows // args.calibration_windows
+        )
         if pvw_cache:
             reference_features = np.empty((len(indices), 23), dtype=np.float32)
             for positions, _, starts, arrays, _ in calibration.iter_raw_windows(calibration.raw_indices(indices)):
@@ -137,8 +135,7 @@ def train(args: argparse.Namespace) -> None:
             if direct:
                 targets.append(sample["labels"])
                 calibration_features.append(sample["features"][-1])
-                if scale_volatility:
-                    volatility_features.append(sample["features"])
+                volatility_features.append(sample["features"])
             else:
                 total += sample["labels"][mask].sum(axis=0, dtype=np.float64)
             if args.normalize_inputs:
@@ -148,23 +145,21 @@ def train(args: argparse.Namespace) -> None:
             count += len(sample["features"]) if direct else int(mask.sum())
         hf.forecast_initialization = "calibrated"
         if direct:
-            calibration_targets = np.asarray(targets)
-            if scale_volatility:
-                import torch
+            import torch
 
-                from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import forecast_window_scale
+            from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import forecast_window_scale
 
-                raw_features = torch.from_numpy(np.stack(volatility_features))
-                rms = forecast_window_scale(raw_features, floor=0, horizon=1).flatten()
-                positive = rms[rms > 0]
-                if not positive.numel():
-                    raise ValueError("Volatility calibration requires windows with nonzero historical returns.")
-                hf.forecast_volatility_floor = float(torch.quantile(positive, 0.05))
-                scale = forecast_window_scale(
-                    raw_features, floor=hf.forecast_volatility_floor, horizon=args.forecast_horizon
-                )
-                calibration_targets = calibration_targets / scale.numpy()
-            hf.forecast_target_quantiles = np.quantile(calibration_targets, hf.forecast_quantiles, axis=0).T.tolist()
+            # Quantiles are learned relative to each window's own volatility,
+            # so intervals follow volatility regimes absent from training.
+            raw_features = torch.from_numpy(np.stack(volatility_features))
+            rms = forecast_window_scale(raw_features, floor=0, horizon=1).flatten()
+            # The floor bounds scaled errors after flat, untraded histories.
+            hf.forecast_volatility_floor = float(torch.quantile(rms[rms > 0], 0.05))
+            scale = forecast_window_scale(
+                raw_features, floor=hf.forecast_volatility_floor, horizon=args.forecast_horizon
+            )
+            scaled_targets = np.asarray(targets) / scale.numpy()
+            hf.forecast_target_quantiles = np.quantile(scaled_targets, hf.forecast_quantiles, axis=0).T.tolist()
         else:
             hf.forecast_target_mean = (total / count).tolist()
         hf.forecast_head_gain = args.head_gain
@@ -196,16 +191,6 @@ def train(args: argparse.Namespace) -> None:
             epoch_windows = dataset.num_windows * args.epochs
             args.steps = math.ceil(epoch_windows / args.global_batch_size)
             logger.info("%d epoch(s) resolve to %d optimizer steps", args.epochs, args.steps)
-        if split == "train" and additional_epochs is not None:
-            additional_steps = math.ceil(dataset.num_windows * additional_epochs / args.global_batch_size)
-            args.steps = args.checkpoint_step + additional_steps
-            logger.info(
-                "%d additional stride-1 epochs: %d windows, %d additional steps, final step %d",
-                additional_epochs,
-                dataset.num_windows,
-                additional_steps,
-                args.steps,
-            )
     if args.warmup_steps >= args.steps:
         raise ValueError("warmup_steps must be less than the resolved training steps.")
     run: ForecastRun = {
@@ -229,13 +214,8 @@ def train(args: argparse.Namespace) -> None:
     if pvw_cache is not None:
         run["pvw_cache"] = str(pvw_cache)
         run["pvw_cache_sha256"] = manifest_digest(pvw_cache)
-    if data_workers is not None:
-        run["data_workers"] = data_workers
-    if train_indices is not None:
-        with train_indices.open("rb") as stream:
-            run["train_indices_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
-    if scheduler_max_steps is not None:
-        run["scheduler_max_steps"] = scheduler_max_steps
+    if args.data_workers is not None:
+        run["data_workers"] = args.data_workers
     if args.validation_indices is not None:
         run["validation_indices"] = str(args.validation_indices)
         run["validation_indices_sha256"] = hashlib.sha256(args.validation_indices.read_bytes()).hexdigest()
@@ -254,28 +234,8 @@ def train(args: argparse.Namespace) -> None:
             "master": "de8f58557096abde4216a701b35fc4368158d111",
             "kronos": "67b630e67f6a18c9e9be918d9b4337c960db1e9a",
         }
-    if args.learning_rate_scale != 1.0:
-        run["learning_rate_scale"] = args.learning_rate_scale
-    previous_run = json.loads((args.output / "run.json").read_text()) if args.resume else None
-    if previous_run is not None and "scheduler_decay_steps" in previous_run:
-        run["scheduler_decay_steps"] = previous_run["scheduler_decay_steps"]
-    if args.rwkv_optimizer and (previous_run is None or "optimizer_policy" in previous_run):
-        run["optimizer_policy"] = "rwkv_lm_v2"
-    load = args.fork_from / "checkpoints" if args.fork_from else args.resume
-    if load and not checkpoint_exists(str(load)):
-        raise FileNotFoundError(f"No native training checkpoint found in {load}.")
-    if args.fork_from:
-        source_run = json.loads((args.fork_from / "run.json").read_text())
-        if additional_epochs is not None:
-            run["scheduler_decay_steps"] = source_run.get("scheduler_decay_steps", source_run["steps"])
-        changed = {key for key in run.keys() | source_run.keys() if source_run.get(key) != run.get(key)}
-        allowed = {"learning_rate_scale", "optimizer_policy"}
-        if additional_epochs is not None:
-            allowed |= {"steps", "sample_budget", "scheduler_decay_steps"}
-        if changed - allowed:
-            raise ValueError(
-                f"Fork requires identical training semantics except LR scale and optimizer policy; changed: {sorted(changed)}"
-            )
+    if args.resume and not checkpoint_exists(str(args.resume)):
+        raise FileNotFoundError(f"No native training checkpoint found in {args.resume}.")
     if int(os.environ.get("RANK", "0")) == 0:
         if args.resume:
             if args.resume.resolve() != (args.output / "checkpoints").resolve():
@@ -292,32 +252,6 @@ def train(args: argparse.Namespace) -> None:
                     targets=np.asarray(targets),
                     **({"reference_features": reference_features} if reference_features is not None else {}),
                 )
-            if args.fork_from:
-                (args.output / "fork.json").write_text(
-                    json.dumps(
-                        {
-                            "source": str(args.fork_from.resolve()),
-                            "checkpoint_step": args.checkpoint_step,
-                            "source_run": source_run,
-                            "learning_rate_scale": args.learning_rate_scale,
-                            "additional_epochs": additional_epochs,
-                        },
-                        indent=2,
-                    )
-                    + "\n"
-                )
-                if additional_epochs is not None:
-                    # Preserve the earlier validation winners across the entire
-                    # trajectory, even if every continuation checkpoint is worse.
-                    for name in (
-                        "best-validation.json",
-                        "best-median-validation.json",
-                        "best-forecast.pt",
-                        "best-median-forecast.pt",
-                    ):
-                        source = args.fork_from / name
-                        if source.exists():
-                            shutil.copy2(source, args.output / name)
     cfg = rwkv7_ohlcv_config(
         hf,
         data=args.data,
@@ -335,38 +269,11 @@ def train(args: argparse.Namespace) -> None:
         covariates=args.covariates,
         validation_indices=args.validation_indices,
         pvw_cache=pvw_cache,
-        train_indices=train_indices,
-        data_workers=data_workers,
+        data_workers=args.data_workers,
     )
-    cfg.checkpoint.load = str(load) if load else None
-    cfg.checkpoint.ckpt_step = args.checkpoint_step
-    cfg.scheduler.lr_decay_iters = run.get("scheduler_decay_steps", args.steps)
-    cfg.scheduler.max_steps = scheduler_max_steps
-    if load and args.rwkv_optimizer:
-        loaded_run = source_run if args.fork_from else previous_run
-        assert loaded_run is not None
-        # Legacy checkpoints stored lr_mult=2 but unscaled LR bounds. Construct
-        # their exact group identities before restoring the corrected policy.
-        cfg.optimizer_config_override_provider.apply_lr_bounds = loaded_run.get("optimizer_policy") == "rwkv_lm_v2"
-    if args.fork_from:
-        # Retain the loaded sample cursor and Adam state on the original
-        # schedule. The callback applies the requested policy after loading.
-        cfg.scheduler.override_opt_param_scheduler = True
-        cfg.scheduler.use_checkpoint_opt_param_scheduler = False
+    cfg.checkpoint.load = str(args.resume) if args.resume else None
     cfg.train.exit_interval = args.exit_interval
-    callbacks = [ForecastExportCallback(args.output, run=run)]
-    official_policy = run.get("optimizer_policy") == "rwkv_lm_v2"
-    if args.learning_rate_scale != 1.0 or official_policy:
-        callbacks.append(ForecastOptimizerCallback(args.learning_rate_scale, rwkv_optimizer=official_policy))
-    if args.diagnostics_interval:
-        from megatron.bridge.recipes.rwkv7.forecast_diagnostics import ForecastDiagnosticsCallback
-
-        callbacks.append(
-            ForecastDiagnosticsCallback(
-                args.output, interval=args.diagnostics_interval, spike_snapshot=args.spike_snapshot
-            )
-        )
-    pretrain(cfg, forecast_forward_step, callbacks=callbacks)
+    pretrain(cfg, forecast_forward_step, callbacks=[ForecastExportCallback(args.output, run=run)])
 
 
 def load_forecaster(checkpoint: Path) -> tuple[RWKV7ForecastModel, ForecastCheckpoint]:
@@ -421,22 +328,32 @@ def predict(args: argparse.Namespace) -> None:
     if model.direct_quantile and model.input_size > 5:
         from hf_forecast.processing_rwkv7_forecast import prepare_features
 
-        if getattr(args, "market", None) is None:
-            raise ValueError("Covariate checkpoints require --market with three same-minute market columns.")
+        from megatron.bridge.data.datasets.ohlcv_covariates import FORECAST_FEATURE_NAMES, MARKET_FEATURE_NAMES
+
         start, _ = segments[-1]
         if context != trained_context:
             raise ValueError("Covariate prediction requires the complete trained context.")
-        market = np.load(args.market, allow_pickle=False)
-        if market.shape != (len(bars), 3):
-            raise ValueError("Market rows must align with the instrument bars.")
+        pvw = hf_config.get("forecast_pvw")
+        columns = hf_config.get(
+            "forecast_feature_columns", pvw["columns"] if pvw else list(range(len(FORECAST_FEATURE_NAMES)))
+        )
+        if any(FORECAST_FEATURE_NAMES[i] in MARKET_FEATURE_NAMES for i in columns):
+            if args.market is None:
+                raise ValueError("This checkpoint requires --market with three same-minute market columns.")
+            market = np.load(args.market, allow_pickle=False)
+            if market.shape != (len(bars), 3):
+                raise ValueError("Market rows must align with the instrument bars.")
+        else:
+            # The feature builder always emits market columns; this checkpoint discards them.
+            market = np.zeros((len(bars), 3), dtype=np.float32)
         values, _ = prepare_features(bars[start:], timestamps[start:], market[start:], context_length=context)
-        features = torch.from_numpy(values).unsqueeze(0).cuda()
-        if pvw := hf_config.get("forecast_pvw"):
+        features = torch.from_numpy(values[..., columns]).unsqueeze(0).cuda()
+        if pvw:
             from megatron.bridge.data.datasets.ohlcv_vmd import denoise_history
 
             close = torch.from_numpy(bars[-context:, 3].copy()).unsqueeze(0).cuda()
             filtered = denoise_history(close, modes=pvw["modes"], alpha=pvw["alpha"])
-            features = torch.cat((features[..., pvw["columns"]], filtered.unsqueeze(-1)), dim=-1)
+            features = torch.cat((features, filtered.unsqueeze(-1)), dim=-1)
     else:
         features = torch.from_numpy(encode_bars(bars[-context - 1 :])).unsqueeze(0).cuda()
     if model.direct_quantile:
@@ -587,32 +504,21 @@ def main() -> None:
     budget.add_argument(
         "--epochs", type=int, help="Complete stride-one direct quantile epochs or nonoverlapping next-bar epochs"
     )
-    budget.add_argument(
-        "--additional-epochs",
-        type=int,
-        help="Additional complete stride-1 passes for direct_quantile with --fork-from; retain the source LR schedule",
-    )
     training.add_argument("--global-batch-size", type=int, default=32)
     training.add_argument("--micro-batch-size", type=int, default=4)
     training.add_argument("--learning-rate", type=float, default=3e-4)
-    training.add_argument(
-        "--learning-rate-scale",
-        type=float,
-        default=1.0,
-        help="Native scheduler multiplier preserving checkpoint groups and RWKV-LM LR ratios",
-    )
     training.add_argument("--warmup-steps", type=int, default=100)
     training.add_argument("--save-interval", type=int, default=1000)
     training.add_argument("--eval-interval", type=int, default=1000)
     training.add_argument("--eval-iters", type=int, default=10)
     training.add_argument("--seed", type=int, default=1234)
-    restore = training.add_mutually_exclusive_group()
-    restore.add_argument("--resume", type=Path)
-    restore.add_argument("--fork-from", type=Path, help="Source run for a separate optimizer-state continuation")
-    training.add_argument("--checkpoint-step", type=int, help="Native checkpoint iteration for --fork-from")
+    training.add_argument("--resume", type=Path)
     training.add_argument("--exit-interval", type=int, help="Native bounded exit, retaining the full LR schedule")
     training.add_argument(
-        "--calibration-windows", type=int, default=0, help="Training windows for head initialization"
+        "--calibration-windows",
+        type=int,
+        default=0,
+        help="Training windows for head initialization; direct_quantile also fits its volatility floor",
     )
     training.add_argument("--head-gain", type=float, default=0.01, help="Orthogonal gain of the calibrated head")
     training.add_argument("--head-fp32", action="store_true", help="Compute the continuous output projection in FP32")
@@ -624,21 +530,9 @@ def main() -> None:
     )
     training.add_argument("--task", choices=("next_bar", "direct_quantile"), default="next_bar")
     training.add_argument("--forecast-horizon", type=int, default=30)
-    training.add_argument("--diagnostics-interval", type=int, default=0, help="Module/activation metrics interval")
-    training.add_argument(
-        "--spike-snapshot", action="store_true", help="Save exact pre-update weights at the first detected spike"
-    )
     training.add_argument("--covariates", type=Path, help="Prepared past-only market and temporal feature cache")
     training.add_argument("--validation-indices", type=Path, help="Frozen stride-one validation index NPY")
     training.add_argument("--pvw-cache", type=Path, help="Frozen per-origin PVW feature cache")
-    training.add_argument("--train-indices", type=Path, help="Ordered raw training window IDs for a fixed-step run")
-    training.add_argument("--scheduler-max-steps", type=int, help="Use the scheduler of a longer reference run")
-    training.add_argument(
-        "--mask-market-inputs", action="store_true", help="Zero the three standardized market features"
-    )
-    training.add_argument(
-        "--scale-volatility", action="store_true", help="Train quantiles in historical volatility units"
-    )
     training.add_argument("--forecast-architecture", choices=("cnn_rwkv_attention",))
     training.add_argument("--data-workers", type=int, help="Persistent DataLoader workers per rank")
     training.set_defaults(handler=train)
@@ -720,38 +614,16 @@ def main() -> None:
             parser.error("PVW requires direct_quantile, 64/30 windows, covariates and frozen validation indices")
         if args.forecast_architecture is not None and args.task != "direct_quantile":
             parser.error("CNN with feature attention requires direct_quantile")
-        if args.epochs is not None and args.fork_from is not None and args.task == "direct_quantile":
-            parser.error("Use --additional-epochs to continue a direct quantile run in a new output directory")
         if args.data_workers is not None and args.data_workers < 0:
             parser.error("Data worker count cannot be negative")
-        if args.additional_epochs is not None and (
-            args.additional_epochs <= 0 or args.fork_from is None or args.task != "direct_quantile"
-        ):
-            parser.error("Positive --additional-epochs requires direct_quantile and --fork-from")
         if (args.covariates or args.validation_indices) and args.task != "direct_quantile":
             parser.error("Covariates and frozen validation indices require direct_quantile")
-        if args.task == "direct_quantile" and args.forecast_horizon <= 0:
-            parser.error("direct_quantile requires a positive --forecast-horizon")
-        if not math.isfinite(args.learning_rate_scale) or args.learning_rate_scale <= 0:
-            parser.error("--learning-rate-scale must be positive and finite")
-        if (args.checkpoint_step is not None) != (args.fork_from is not None):
-            parser.error("--fork-from and --checkpoint-step must be supplied together")
-        if args.checkpoint_step is not None and args.checkpoint_step <= 0:
-            parser.error("--checkpoint-step must be positive")
+        if args.task == "direct_quantile" and (args.forecast_horizon <= 0 or args.calibration_windows <= 0):
+            parser.error("direct_quantile requires a positive --forecast-horizon and --calibration-windows")
         if args.normalize_inputs and not args.calibration_windows:
             parser.error("--normalize-inputs requires --calibration-windows > 0")
-        if args.spike_snapshot and not args.diagnostics_interval:
-            parser.error("--spike-snapshot requires --diagnostics-interval > 0")
-        if args.steps is None and args.epochs is None and args.additional_epochs is None:
+        if args.steps is None and args.epochs is None:
             args.steps = 10000
-        if args.train_indices is not None and (args.task != "direct_quantile" or args.steps is None):
-            parser.error("--train-indices requires a fixed-step direct_quantile run")
-        if args.scheduler_max_steps is not None and (args.steps is None or args.scheduler_max_steps < args.steps):
-            parser.error("--scheduler-max-steps requires a fixed-step run and must cover --steps")
-        if args.mask_market_inputs and (args.covariates is None or not args.normalize_inputs):
-            parser.error("--mask-market-inputs requires covariates and --normalize-inputs")
-        if args.scale_volatility and (args.task != "direct_quantile" or not args.calibration_windows):
-            parser.error("--scale-volatility requires direct_quantile and --calibration-windows > 0")
         if (
             any(
                 value <= 0
@@ -768,7 +640,6 @@ def main() -> None:
             or args.warmup_steps < 0
             or args.calibration_windows < 0
             or args.head_gain <= 0
-            or args.diagnostics_interval < 0
             or (args.steps is not None and (args.steps <= 0 or args.warmup_steps >= args.steps))
             or (args.epochs is not None and args.epochs <= 0)
         ):
