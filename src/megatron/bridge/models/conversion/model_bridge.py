@@ -2063,8 +2063,10 @@ class MegatronModelBridge(
                 converted_weights_dict = task.mapping.megatron_to_hf(megatron_weights, megatron_module)
             adapter_tasks = None
             task_global_base_prefix = None
-            if merge_adapter_weights and "to_wrap.weight" in task.global_param_name:
-                task_global_base_prefix, _, _ = task.global_param_name.partition(".to_wrap.weight")
+            if merge_adapter_weights:
+                task_global_base_prefix = self._get_lora_unwrapped_name(task.global_param_name).rpartition(".weight")[
+                    0
+                ]
                 adapter_tasks = adapter_tasks_by_base.get(task_global_base_prefix)
 
             # --- Grouped export path: accumulate per-expert weights, yield when complete ---

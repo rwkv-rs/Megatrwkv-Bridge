@@ -3,6 +3,8 @@
 
 """HF config and lossless replicated weight mapping for RWKV-7."""
 
+from collections.abc import Iterable
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -11,11 +13,17 @@ from megatron.core.utils import unwrap_model
 from transformers import PretrainedConfig
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
 from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
+from megatron.bridge.models.conversion.peft_bridge import (
+    AdapterWeight,
+    AdapterWeightConversionTask,
+    _split_hf_lora_weight_name,
+)
 from megatron.bridge.models.rwkv7.modeling_rwkv7 import RWKV7Model
 from megatron.bridge.models.rwkv7.rwkv7_config import RWKV7ModelConfig
 from megatron.bridge.models.transformer_config import TransformerConfig
+from megatron.bridge.peft.rwkv7 import _RWKV7LoRALinear
 
 
 @MegatronModelBridge.register_bridge(source="RwkvForCausalLM", target=RWKV7Model, model_type="rwkv")
@@ -25,6 +33,87 @@ class RWKV7Bridge(MegatronModelBridge):
     MODEL_CONFIG_CLASS = RWKV7ModelConfig
     USE_MODEL_CONFIG_FOR_CONVERSION = True
     ADDITIONAL_FILE_PATTERNS = ["*generation_config.json"]
+
+    def _get_lora_unwrapped_name(self, megatron_param: str) -> str:
+        return super()._get_lora_unwrapped_name(megatron_param).replace(".base_layer.", ".")
+
+    def _is_adapter_param_name(self, param_name: str) -> bool:
+        return param_name.endswith((".lora_A.default.weight", ".lora_B.default.weight"))
+
+    def _adapter_target_modules(self, adapter_weight_names: Iterable[str]) -> list[str]:
+        """Limit PEFT reload to projections that have exported weights."""
+        return sorted({_split_hf_lora_weight_name(name)[0] for name in adapter_weight_names})
+
+    def _merge_lora_adapter_weights(
+        self,
+        megatron_model: list[RWKV7Model],
+        converted_weights_dict: dict[str, torch.Tensor],
+        adapter_weights: list[AdapterWeight],
+    ) -> dict[str, torch.Tensor]:
+        # Keep exported A unchanged; normalize only the NoRA merge computation.
+        models = unwrap_model(megatron_model)
+        weights = []
+        for adapter in adapter_weights:
+            module = models[adapter.linear_in_weight.vp_stage].get_submodule(adapter.global_base_prefix)
+            if "default" in module.merged_adapters:
+                continue
+            if module.use_nora["default"]:
+                a = adapter.linear_in_weight.weight.float()
+                a = a / (a.norm(dim=0, keepdim=True) + 1e-6)
+                adapter = replace(adapter, linear_in_weight=adapter.linear_in_weight._replace(weight=a))
+            weights.append(adapter)
+        if not weights:
+            return converted_weights_dict
+        return super()._merge_lora_adapter_weights(megatron_model, converted_weights_dict, weights)
+
+    def build_adapter_conversion_tasks(
+        self,
+        megatron_model: RWKV7Model | list[RWKV7Model],
+        exclude_adapter_base_prefixes: Iterable[str] | None = None,
+    ) -> dict[str, list[AdapterWeightConversionTask]]:
+        """Use native PEFT A/B parameters with Bridge's replicated export tasks.
+
+        RWKV7 has one complete model replica per data-parallel rank. All ranks
+        construct the same tasks and participate in AutoBridge export; its
+        existing save path writes the adapter on rank zero.
+        """
+        models = megatron_model if isinstance(megatron_model, list) else [megatron_model]
+        models = unwrap_model(models)
+        excluded = tuple(exclude_adapter_base_prefixes or ())
+        registry = self.mapping_registry()
+        tasks = {}
+        for vp_stage, model in enumerate(models):
+            for prefix, module in model.named_modules():
+                if not isinstance(module, _RWKV7LoRALinear) or prefix.startswith(excluded):
+                    continue
+                base_mapping = registry.megatron_to_hf_lookup(f"{prefix}.weight")
+                hf_prefix = base_mapping.hf_param.removesuffix(".weight")
+                factors = []
+                for factor in ("lora_A", "lora_B"):
+                    linear = getattr(module, factor)["default"]
+                    name = f"{prefix}.{factor}.default.weight"
+                    factors.append(
+                        WeightConversionTask(
+                            param_name=name,
+                            global_param_name=name,
+                            mapping=ReplicatedMapping(megatron_param=name, hf_param=f"{hf_prefix}.{factor}.weight"),
+                            pp_rank=0,
+                            vp_stage=vp_stage,
+                            megatron_module=linear,
+                            param_weight=linear.weight,
+                        )
+                    )
+                tasks[prefix] = [
+                    AdapterWeightConversionTask(
+                        global_base_prefix=prefix,
+                        adapter_key=None,
+                        alpha=module.lora_alpha["default"],
+                        dim=module.r["default"],
+                        linear_in_task=factors[0],
+                        linear_out_task=factors[1],
+                    )
+                ]
+        return tasks
 
     def load_weights_hf_to_megatron(
         self, hf_pretrained: Any, megatron_model: Any, allowed_mismatched_params: list[str] | None = None

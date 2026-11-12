@@ -192,6 +192,7 @@ class TestBuildAdapterConfigDict:
         assert config["base_model_name_or_path"] == "foo/bar"
         assert config["task_type"] == "CAUSAL_LM"
         assert config["use_dora"] is False
+        assert "use_nora" not in config
         assert config["inference_mode"] is True
         assert config["bias"] == "none"
         assert "target_parameters" not in config

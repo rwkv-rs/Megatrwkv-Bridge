@@ -1987,11 +1987,10 @@ def build_adapter_config_dict(
     base_model_name_or_path: Optional[str] = None,
     rank_pattern: Optional[Dict[str, int]] = None,
 ) -> Dict[str, object]:
-    """Build an HF PEFT-compatible ``adapter_config.json`` dictionary.
+    """Build an ``adapter_config.json`` dictionary for PEFT or native serving.
 
-    The returned dict can be serialised directly with ``json.dump`` and is
-    loadable by ``peft.PeftModel.from_pretrained`` without any runtime
-    dependency on the ``peft`` pip package.
+    The returned dict can be serialized directly with ``json.dump``.
+    Native RWKV7 NoRA adds a ``use_nora`` flag for NoRA-aware loaders.
     """
 
     from megatron.bridge.peft.dora import DoRA
@@ -2017,4 +2016,6 @@ def build_adapter_config_dict(
     }
     if target_parameters:
         config["target_parameters"] = target_parameters
+    if getattr(peft_config, "use_nora", False):
+        config["use_nora"] = True
     return config

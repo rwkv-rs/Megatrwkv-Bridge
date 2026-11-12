@@ -3,6 +3,8 @@
 
 """Single-GPU RWKV-7 forward parity and fused LoRA optimizer-step checks."""
 
+import json
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -11,11 +13,71 @@ from transformers import RwkvConfig, RwkvForCausalLM
 
 pytest.importorskip("transformers.integrations.flash_rwkv2", reason="Requires transformers-rwkv RWKV-7")
 
+from megatron.bridge import AutoBridge
 from megatron.bridge.models.rwkv7 import RWKV7Bridge, RWKV7Model
 from megatron.bridge.peft.rwkv7 import RWKV7LoRA
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA and FlashRWKV2")
+
+
+@pytest.mark.parametrize("use_nora", [False, True])
+def test_native_adapter_export_after_optimizer_step(tmp_path, use_nora):
+    from peft import PeftModel
+    from safetensors.torch import load_file
+
+    torch.manual_seed(2026)
+    config = RwkvConfig(
+        hidden_size=128,
+        num_hidden_layers=2,
+        vocab_size=256,
+        context_length=64,
+        architectures=["RwkvForCausalLM"],
+    )
+    bridge = AutoBridge.from_hf_config(config)
+    model = RWKV7Model(bridge.get_model_config(), pg_collection=None).cuda().train()
+    base_state = {name: parameter.detach().clone() for name, parameter in model.hf.state_dict().items()}
+    peft = RWKV7LoRA(dim=8, alpha=16, use_nora=use_nora)
+    peft(model)
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=1e-3)
+    tokens = torch.randint(config.vocab_size, (1, 64), device="cuda")
+    labels = tokens.roll(-1, dims=1)
+    loss = model(tokens, labels=labels).mean()
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert all(torch.isfinite(parameter.grad).all() for parameter in trainable if parameter.grad is not None)
+    optimizer.step()
+    model.eval()
+    with torch.no_grad():
+        expected = model(tokens)
+    bridge.save_hf_adapter([model], tmp_path, peft, show_progress=False)
+    saved = load_file(tmp_path / "adapter_model.safetensors")
+    assert len(saved) == 24
+    adapter_config = json.loads((tmp_path / "adapter_config.json").read_text())
+    restored = RwkvForCausalLM(config).to(device="cuda", dtype=torch.bfloat16).eval()
+    restored.load_state_dict(base_state)
+    if use_nora:
+        RWKV7LoRA(
+            dim=adapter_config["r"],
+            alpha=adapter_config["lora_alpha"],
+            target_modules=adapter_config["target_modules"],
+            use_nora=adapter_config["use_nora"],
+        )(restored)
+        missing, unexpected = restored.load_state_dict(
+            {
+                name.removeprefix("base_model.model.").replace(".weight", ".default.weight"): parameter
+                for name, parameter in saved.items()
+            },
+            strict=False,
+        )
+        assert not unexpected and all("lora_" not in name for name in missing)
+    else:
+        restored = PeftModel.from_pretrained(restored, tmp_path)
+    with torch.no_grad():
+        actual = restored(tokens, use_cache=False).logits.float()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.equal(actual.argmax(-1), expected.argmax(-1))
 
 
 @pytest.mark.parametrize("use_nora", [False, True])

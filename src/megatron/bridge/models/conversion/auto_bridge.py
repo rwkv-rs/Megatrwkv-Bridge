@@ -1167,12 +1167,28 @@ class AutoBridge(Generic[MegatronModelT]):
         expand_shared_outer: bool = False,
         allow_serving_layout: bool = False,
     ) -> None:
-        """Save LoRA adapter weights as a HuggingFace PEFT-compatible directory.
+        """Save LoRA adapter weights in Hugging Face PEFT or native serving format.
 
         The output directory contains ``adapter_config.json`` and
-        ``adapter_model.safetensors`` and can be loaded directly with
-        ``peft.PeftModel.from_pretrained(base_model, path)`` -- except when
-        ``allow_serving_layout`` is used, which writes a serving-only layout.
+        ``adapter_model.safetensors``. Standard adapters can be loaded with
+        ``peft.PeftModel.from_pretrained(base_model, path)``.
+
+        RWKV7 NoRA exports the original A/B tensors and records ``use_nora`` in
+        the config. In irwkv's ``rwkv_lora`` configuration, set ``use_nora`` to
+        ``true`` and match ``r`` and ``lora_alpha`` to the export. Set the required
+        ``target_modules`` to the irwkv selectors for the exported projections.
+        For the default RWKV7 adapter, use ``r_proj``, ``k_proj``, ``v_proj``,
+        ``o_proj``, ``mlp.key``, and ``mlp.value``. The exported
+        ``adapter_config.json`` lists full HF module paths for PEFT. See the
+        `irwkv serving configuration and adapter request example`_.
+
+        Stock PEFT ignores ``use_nora`` and applies ordinary LoRA. To load a
+        complete model directly in Transformers, use :meth:`save_hf_pretrained`
+        to merge the NoRA weights.
+        See ``allow_serving_layout`` below for serving-only shared-outer MoE exports.
+
+        .. _irwkv serving configuration and adapter request example:
+           https://github.com/rwkv-org/irwkv/blob/81b2f7f128603171a7c5bc4f28c44cc7641251b0/docs/models/rwkv.md#L199-L248
 
         Args:
             model: Megatron model instance or list of instances.
