@@ -68,6 +68,9 @@ def train(args: argparse.Namespace) -> None:
     pvw_cache = getattr(args, "pvw_cache", None)
     architecture = getattr(args, "forecast_architecture", None)
     data_workers = getattr(args, "data_workers", None)
+    train_indices = getattr(args, "train_indices", None)
+    scale_volatility = getattr(args, "scale_volatility", False)
+    scheduler_max_steps = getattr(args, "scheduler_max_steps", None)
     dataset_class = (
         partial(OHLCVQuantileWindowDataset, covariates=args.covariates, pvw_cache=pvw_cache)
         if direct
@@ -91,10 +94,20 @@ def train(args: argparse.Namespace) -> None:
 
         hf.forecast_input_size = len(FORECAST_FEATURE_NAMES)
         hf.forecast_feature_names = list(FORECAST_FEATURE_NAMES)
+    if getattr(args, "mask_market_inputs", False):
+        hf.forecast_masked_features = [
+            hf.forecast_feature_names.index(name)
+            for name in ("market_return", "market_volatility", "market_up_fraction")
+        ]
     reference_features = None
-    if args.calibration_windows:
+    if train_indices or args.calibration_windows:
         import numpy as np
 
+    if train_indices:
+        selection = np.load(train_indices, mmap_mode="r", allow_pickle=False)
+        if selection.shape != (args.steps * args.global_batch_size,) or selection.dtype != np.dtype("int64"):
+            raise ValueError("Training selection must contain one int64 window ID per scheduled sample.")
+    if args.calibration_windows:
         calibration = dataset_class(
             args.data,
             split="train",
@@ -103,6 +116,7 @@ def train(args: argparse.Namespace) -> None:
             stride=1 if direct else args.context,
             keep_tail=not direct,
             seed=args.seed,
+            window_indices=train_indices,
         )
         total, feature_total, feature_squares = (
             np.zeros(getattr(hf, "forecast_input_size", 5), dtype=np.float64) for _ in range(3)
@@ -110,9 +124,9 @@ def train(args: argparse.Namespace) -> None:
         count = 0
         targets = []
         calibration_features = []
-        indices = (
-            np.arange(args.calibration_windows, dtype=np.int64) * calibration.num_windows // args.calibration_windows
-        )
+        volatility_features = []
+        calibration_pool = len(selection) if train_indices else calibration.num_windows
+        indices = np.arange(args.calibration_windows, dtype=np.int64) * calibration_pool // args.calibration_windows
         if pvw_cache:
             reference_features = np.empty((len(indices), 23), dtype=np.float32)
             for positions, _, starts, arrays, _ in calibration.iter_raw_windows(calibration.raw_indices(indices)):
@@ -123,6 +137,8 @@ def train(args: argparse.Namespace) -> None:
             if direct:
                 targets.append(sample["labels"])
                 calibration_features.append(sample["features"][-1])
+                if scale_volatility:
+                    volatility_features.append(sample["features"])
             else:
                 total += sample["labels"][mask].sum(axis=0, dtype=np.float64)
             if args.normalize_inputs:
@@ -132,7 +148,23 @@ def train(args: argparse.Namespace) -> None:
             count += len(sample["features"]) if direct else int(mask.sum())
         hf.forecast_initialization = "calibrated"
         if direct:
-            hf.forecast_target_quantiles = np.quantile(targets, hf.forecast_quantiles, axis=0).T.tolist()
+            calibration_targets = np.asarray(targets)
+            if scale_volatility:
+                import torch
+
+                from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import forecast_window_scale
+
+                raw_features = torch.from_numpy(np.stack(volatility_features))
+                rms = forecast_window_scale(raw_features, floor=0, horizon=1).flatten()
+                positive = rms[rms > 0]
+                if not positive.numel():
+                    raise ValueError("Volatility calibration requires windows with nonzero historical returns.")
+                hf.forecast_volatility_floor = float(torch.quantile(positive, 0.05))
+                scale = forecast_window_scale(
+                    raw_features, floor=hf.forecast_volatility_floor, horizon=args.forecast_horizon
+                )
+                calibration_targets = calibration_targets / scale.numpy()
+            hf.forecast_target_quantiles = np.quantile(calibration_targets, hf.forecast_quantiles, axis=0).T.tolist()
         else:
             hf.forecast_target_mean = (total / count).tolist()
         hf.forecast_head_gain = args.head_gain
@@ -199,6 +231,11 @@ def train(args: argparse.Namespace) -> None:
         run["pvw_cache_sha256"] = manifest_digest(pvw_cache)
     if data_workers is not None:
         run["data_workers"] = data_workers
+    if train_indices is not None:
+        with train_indices.open("rb") as stream:
+            run["train_indices_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+    if scheduler_max_steps is not None:
+        run["scheduler_max_steps"] = scheduler_max_steps
     if args.validation_indices is not None:
         run["validation_indices"] = str(args.validation_indices)
         run["validation_indices_sha256"] = hashlib.sha256(args.validation_indices.read_bytes()).hexdigest()
@@ -298,11 +335,13 @@ def train(args: argparse.Namespace) -> None:
         covariates=args.covariates,
         validation_indices=args.validation_indices,
         pvw_cache=pvw_cache,
+        train_indices=train_indices,
         data_workers=data_workers,
     )
     cfg.checkpoint.load = str(load) if load else None
     cfg.checkpoint.ckpt_step = args.checkpoint_step
     cfg.scheduler.lr_decay_iters = run.get("scheduler_decay_steps", args.steps)
+    cfg.scheduler.max_steps = scheduler_max_steps
     if load and args.rwkv_optimizer:
         loaded_run = source_run if args.fork_from else previous_run
         assert loaded_run is not None
@@ -592,6 +631,14 @@ def main() -> None:
     training.add_argument("--covariates", type=Path, help="Prepared past-only market and temporal feature cache")
     training.add_argument("--validation-indices", type=Path, help="Frozen stride-one validation index NPY")
     training.add_argument("--pvw-cache", type=Path, help="Frozen per-origin PVW feature cache")
+    training.add_argument("--train-indices", type=Path, help="Ordered raw training window IDs for a fixed-step run")
+    training.add_argument("--scheduler-max-steps", type=int, help="Use the scheduler of a longer reference run")
+    training.add_argument(
+        "--mask-market-inputs", action="store_true", help="Zero the three standardized market features"
+    )
+    training.add_argument(
+        "--scale-volatility", action="store_true", help="Train quantiles in historical volatility units"
+    )
     training.add_argument("--forecast-architecture", choices=("cnn_rwkv_attention",))
     training.add_argument("--data-workers", type=int, help="Persistent DataLoader workers per rank")
     training.set_defaults(handler=train)
@@ -697,6 +744,14 @@ def main() -> None:
             parser.error("--spike-snapshot requires --diagnostics-interval > 0")
         if args.steps is None and args.epochs is None and args.additional_epochs is None:
             args.steps = 10000
+        if args.train_indices is not None and (args.task != "direct_quantile" or args.steps is None):
+            parser.error("--train-indices requires a fixed-step direct_quantile run")
+        if args.scheduler_max_steps is not None and (args.steps is None or args.scheduler_max_steps < args.steps):
+            parser.error("--scheduler-max-steps requires a fixed-step run and must cover --steps")
+        if args.mask_market_inputs and (args.covariates is None or not args.normalize_inputs):
+            parser.error("--mask-market-inputs requires covariates and --normalize-inputs")
+        if args.scale_volatility and (args.task != "direct_quantile" or not args.calibration_windows):
+            parser.error("--scale-volatility requires direct_quantile and --calibration-windows > 0")
         if (
             any(
                 value <= 0

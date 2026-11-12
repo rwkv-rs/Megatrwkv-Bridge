@@ -85,6 +85,8 @@ class ForecastRun(TypedDict):
     validation_indices_sha256: NotRequired[str]
     pvw_cache: NotRequired[str]
     pvw_cache_sha256: NotRequired[str]
+    train_indices_sha256: NotRequired[str]
+    scheduler_max_steps: NotRequired[int]
     data_workers: NotRequired[int]
 
 
@@ -112,6 +114,7 @@ class OHLCVDatasetConfig(DatasetProvider):
     covariates: str | None = None
     validation_indices: str | None = None
     pvw_cache: str | None = None
+    train_indices: str | None = None
 
     def build_datasets(
         self, context: DatasetBuildContext
@@ -145,7 +148,9 @@ class OHLCVDatasetConfig(DatasetProvider):
                     epochs=self.epochs if split == "train" else None,
                     cycle_length=self.evaluation_samples if split != "train" else None,
                     covariates=Path(self.covariates) if self.covariates else None,
-                    window_indices=Path(self.validation_indices)
+                    window_indices=Path(self.train_indices)
+                    if split == "train" and self.train_indices
+                    else Path(self.validation_indices)
                     if split == "validation" and self.validation_indices
                     else None,
                 )
@@ -173,6 +178,7 @@ def rwkv7_ohlcv_config(
     covariates: Path | None = None,
     validation_indices: Path | None = None,
     pvw_cache: Path | None = None,
+    train_indices: Path | None = None,
     data_workers: int | None = None,
 ) -> ConfigContainer:
     """Build continuous RWKV7 training with fixed, distributed holdout windows.
@@ -196,6 +202,7 @@ def rwkv7_ohlcv_config(
         covariates=str(covariates) if covariates else None,
         validation_indices=str(validation_indices) if validation_indices else None,
         pvw_cache=str(pvw_cache) if pvw_cache else None,
+        train_indices=str(train_indices) if train_indices else None,
     )
     cfg.model.calculate_per_token_loss = True
     cfg.ddp.average_in_collective = False
@@ -260,7 +267,15 @@ def forecast_forward_step(
     labels = batch["labels"].cuda(non_blocking=True)
     levels = tuple(state.cfg.model.hf_config.get("forecast_quantiles", ()))
     price_error = None
-    if levels and not model.training and state.cfg.dataset.epochs is not None:
+    if (
+        levels
+        and not model.training
+        and (
+            state.cfg.dataset.epochs is not None
+            or state.cfg.dataset.train_indices is not None
+            or "forecast_volatility_floor" in state.cfg.model.hf_config
+        )
+    ):
         predictions = model(features=features)
         output = forecast_pinball(predictions, labels, levels)
         median = predictions.sort(dim=-1).values[..., levels.index(0.5)]

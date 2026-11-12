@@ -467,6 +467,41 @@ def test_direct_quantile_head_loss_gradients_and_rearrangement(config, input_siz
     restored.load_state_dict(model.state_dict(), strict=True)
 
 
+def test_masked_market_and_volatility_scaled_training_and_inference(config):
+    config.hf_config.update(
+        forecast_task="direct_quantile",
+        forecast_horizon=3,
+        forecast_quantiles=[0.1, 0.5, 0.9],
+        forecast_input_mean=[1.0] * 5,
+        forecast_input_std=[2.0] * 5,
+        forecast_masked_features=[2, 3, 4],
+        forecast_volatility_floor=0.25,
+    )
+    model = RWKV7ForecastModel(config, None)
+    features = torch.randn(2, 8, 5)
+    features[0, :, 1] = 0
+    features[1, :, 1] = 2
+    perturbed = features.clone()
+    perturbed[..., 2:] += 100
+    labels = torch.tensor([[0.1, 0.2, 0.3], [-0.1, -0.2, -0.3]])
+    scale = torch.tensor([[0.25], [2.0]]) * torch.arange(1, 4).sqrt()
+    with patch.object(
+        model.hf, "forward", side_effect=lambda **kw: SimpleNamespace(last_hidden_state=kw["inputs_embeds"])
+    ):
+        loss = model(features, labels, return_channel_losses=True)
+        torch.testing.assert_close(loss, model(perturbed, labels, return_channel_losses=True), rtol=0, atol=0)
+        model.eval()
+        prediction = model(features)
+        torch.testing.assert_close(prediction, model(perturbed), rtol=0, atol=0)
+        error = (labels.unsqueeze(-1) - prediction) / scale.unsqueeze(-1)
+        levels = torch.tensor([0.1, 0.5, 0.9])
+        torch.testing.assert_close(loss, torch.maximum(levels * error, (levels - 1) * error))
+        torch.testing.assert_close(model(features, labels, return_channel_losses=True), loss * scale.unsqueeze(-1))
+    restored = RWKV7ForecastModel(RWKV7ForecastConfig.from_dict(config.as_dict()), None)
+    restored.load_state_dict(model.state_dict(), strict=True)
+    torch.testing.assert_close(restored.input_feature_mask, model.input_feature_mask)
+
+
 def test_quantile_masked_microbatches_preserve_global_normalization():
     prediction = torch.tensor([[1.0, 3.0], [5.0, 7.0]], requires_grad=True)
     mask = torch.tensor([[1.0, 1.0], [1.0, 0.0]])
