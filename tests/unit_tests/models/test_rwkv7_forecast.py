@@ -354,6 +354,7 @@ def test_direct_quantile_training_excludes_market_inputs_and_calibrates_scaled_t
         eval_interval=10,
         seed=2026,
         data_workers=None,
+        early_stopping_patience=0,
         resume=None,
         exit_interval=None,
     )
@@ -404,6 +405,38 @@ def test_quantile_masked_microbatches_preserve_global_normalization():
     split_grad = torch.autograd.grad(sum(part[0] for part in parts) / sum(part[1] for part in parts), prediction)[0]
     torch.testing.assert_close(global_grad, split_grad)
     assert split_grad[1, 1] == 0
+
+
+def test_early_stopping_requests_native_exit_after_patience(tmp_path):
+    from megatron.bridge.recipes.rwkv7.forecast import ForecastExportCallback
+
+    run = {"hf_config": {"forecast_task": "direct_quantile"}}
+    callback = ForecastExportCallback(tmp_path, run=run, patience=1000)
+    exported = []
+    callback._export = lambda context, name: exported.append((context.state.train_state.step, name))
+    cfg = SimpleNamespace(train=SimpleNamespace(exit_interval=None))
+
+    def evaluate(step, pinball):
+        context = SimpleNamespace(
+            total_loss_dict={"forecast pinball": pinball, "forecast/q0.5": pinball / 2},
+            state=SimpleNamespace(train_state=SimpleNamespace(step=step), cfg=cfg),
+        )
+        with patch("torch.distributed.get_rank", return_value=0):
+            callback.on_eval_end(context)
+
+    evaluate(250, 0.20)
+    evaluate(500, 0.15)  # best
+    for step in (750, 1000, 1250):
+        evaluate(step, 0.16)
+        assert cfg.train.exit_interval is None, step
+    # 1500 - 500 reaches the 1000-step patience.
+    evaluate(1500, 0.16)
+    assert cfg.train.exit_interval == 1500
+    assert callback.best_step == 500 and callback.best_loss == 0.15
+    assert ("best-forecast.pt" in name for _, name in exported)
+    # A fresh callback resumes the recorded best step, not step zero.
+    resumed = ForecastExportCallback(tmp_path, run=run, patience=1000)
+    assert resumed.best_step == 500 and resumed.best_loss == 0.15
 
 
 def test_quantile_evaluation_proper_scores_and_price_units():

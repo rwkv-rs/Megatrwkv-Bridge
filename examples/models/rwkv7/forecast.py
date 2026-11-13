@@ -219,6 +219,8 @@ def train(args: argparse.Namespace) -> None:
     if args.packed_train is not None:
         run["packed_train"] = str(args.packed_train)
         run["packed_train_sha256"] = manifest_digest(args.packed_train)
+    if args.early_stopping_patience:
+        run["early_stopping_patience"] = args.early_stopping_patience
     if args.data_workers is not None:
         run["data_workers"] = args.data_workers
     if args.validation_indices is not None:
@@ -279,7 +281,8 @@ def train(args: argparse.Namespace) -> None:
     )
     cfg.checkpoint.load = str(args.resume) if args.resume else None
     cfg.train.exit_interval = args.exit_interval
-    pretrain(cfg, forecast_forward_step, callbacks=[ForecastExportCallback(args.output, run=run)])
+    callback = ForecastExportCallback(args.output, run=run, patience=args.early_stopping_patience or None)
+    pretrain(cfg, forecast_forward_step, callbacks=[callback])
 
 
 def load_forecaster(checkpoint: Path) -> tuple[RWKV7ForecastModel, ForecastCheckpoint]:
@@ -514,9 +517,15 @@ def main() -> None:
     training.add_argument("--micro-batch-size", type=int, default=4)
     training.add_argument("--learning-rate", type=float, default=3e-4)
     training.add_argument("--warmup-steps", type=int, default=100)
-    training.add_argument("--save-interval", type=int, default=1000)
-    training.add_argument("--eval-interval", type=int, default=1000)
+    training.add_argument("--save-interval", type=int, default=250)
+    training.add_argument("--eval-interval", type=int, default=250)
     training.add_argument("--eval-iters", type=int, default=10)
+    training.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=1000,
+        help="Stop when validation pinball has not improved for this many steps; 0 disables",
+    )
     training.add_argument("--seed", type=int, default=1234)
     training.add_argument("--resume", type=Path)
     training.add_argument("--exit-interval", type=int, help="Native bounded exit, retaining the full LR schedule")
@@ -655,6 +664,8 @@ def main() -> None:
             parser.error("--packed-train requires direct_quantile")
         if args.data_workers is not None and args.data_workers < 0:
             parser.error("Data worker count cannot be negative")
+        if args.early_stopping_patience < 0 or args.early_stopping_patience % args.eval_interval:
+            parser.error("--early-stopping-patience must be nonnegative and a multiple of --eval-interval")
         if (args.covariates or args.validation_indices) and args.task != "direct_quantile":
             parser.error("Covariates and frozen validation indices require direct_quantile")
         if args.task == "direct_quantile" and (args.forecast_horizon <= 0 or args.calibration_windows <= 0):

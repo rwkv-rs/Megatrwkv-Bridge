@@ -69,6 +69,7 @@ class ForecastRun(TypedDict):
     save_interval: int
     eval_interval: int
     eval_iters: int
+    early_stopping_patience: NotRequired[int]
     seed: int
     world_size: int
     forecast_references: NotRequired[dict[str, str]]
@@ -286,15 +287,24 @@ def forecast_forward_step(
 
 
 class ForecastExportCallback(Callback):
-    """Export replicated forecast weights for single-process inference."""
+    """Export replicated forecast weights for single-process inference.
 
-    def __init__(self, output: Path, *, run: ForecastRun) -> None:
-        self.output, self.run = output, run
+    With ``patience`` steps set, training stops once the fixed-window pinball
+    loss has not improved for that many steps. Pinball is the selection and
+    stopping criterion because it scores the whole predicted interval, charging
+    both missing coverage and excess width.
+    """
+
+    def __init__(self, output: Path, *, run: ForecastRun, patience: int | None = None) -> None:
+        self.output, self.run, self.patience = output, run, patience
         self.best_loss = float("inf")
         self.best_median_loss = float("inf")
+        self.best_step = 0
         selection = output / "best-validation.json"
         if selection.exists():
-            self.best_loss = json.loads(selection.read_text())["pinball"]
+            record = json.loads(selection.read_text())
+            self.best_loss = record["pinball"]
+            self.best_step = record["step"]
         median_selection = output / "best-median-validation.json"
         if median_selection.exists():
             record = json.loads(median_selection.read_text())
@@ -315,10 +325,20 @@ class ForecastExportCallback(Callback):
             with (self.output / "validation.jsonl").open("a") as stream:
                 stream.write(json.dumps(record) + "\n")
         if score < self.best_loss:
-            self.best_loss = score
+            self.best_loss, self.best_step = score, record["step"]
             if torch.distributed.get_rank() == 0:
                 self._export(context, "best-forecast.pt")
                 (self.output / "best-validation.json").write_text(json.dumps(record, indent=2) + "\n")
+        elif self.patience is not None and record["step"] - self.best_step >= self.patience:
+            # The native loop owns checkpointing and shutdown; ask it to exit at
+            # this step so the run ends through the ordinary iteration path.
+            logger.info(
+                "Early stopping: validation pinball has not improved since step %d (best %.5f, now %.5f)",
+                self.best_step,
+                self.best_loss,
+                score,
+            )
+            context.state.cfg.train.exit_interval = record["step"]
         if median_score < self.best_median_loss:
             self.best_median_loss = median_score
             if torch.distributed.get_rank() == 0:

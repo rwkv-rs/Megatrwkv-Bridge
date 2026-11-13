@@ -291,6 +291,15 @@ timeout 8h uv run --no-sync python -m torch.distributed.run --standalone --nproc
   --rwkv-optimizer
 ```
 
+Validation runs every 250 steps, and training stops once that fixed-window
+pinball loss has gone 1,000 steps without improving (`--early-stopping-patience 0`
+disables it). The earlier L12D768 run reached its best validation pinball at step
+**500** of a 47,585-step epoch and never beat it in the following 8,500 steps, so
+the remaining budget only fit the training period more closely. Pinball is the
+stopping criterion because it scores the whole interval, charging both missing
+coverage and excess width. The callback asks the native loop to exit at that
+iteration, so the usual checkpoint and shutdown path still runs.
+
 `best-forecast.pt` stores the earliest checkpoint with the lowest fixed-window
 validation pinball loss; `best-validation.json` records its score and step.
 `forecast.pt` stores the last training weights. Native checkpoints retain the
@@ -569,13 +578,13 @@ timeout 2h uv run --no-sync python examples/models/rwkv7/forecast.py pack \
 
 timeout 168h uv run --no-sync python -m torch.distributed.run --standalone --nproc_per_node=8 \
   examples/models/rwkv7/forecast.py train --task direct_quantile --epochs 1 \
-  --forecast-architecture cnn_rwkv_attention --config examples/models/rwkv7/forecast-l12-d768.json \
+  --forecast-architecture cnn_rwkv_attention --config examples/models/rwkv7/forecast-l24-d256.json \
   --data "$FORECAST_DATA" --covariates "$FORECAST_COVARIATES" --pvw-cache "$FORECAST_PVW" \
   --packed-train "$FORECAST_PACKED" \
   --validation-indices "$FORECAST_VALIDATION" --output "$FORECAST_RUN" \
   --context 64 --forecast-horizon 30 --global-batch-size 12288 --micro-batch-size "$FORECAST_MICROBATCH" \
-  --learning-rate 1e-4 --warmup-steps 100 --eval-iters 1 --eval-interval 500 --save-interval 500 \
-  --seed 1234 --calibration-windows 4096 --normalize-inputs --head-gain 0.01 --head-fp32 --rwkv-optimizer
+  --learning-rate 1e-4 --warmup-steps 100 --eval-iters 1 --seed 1234 \
+  --calibration-windows 4096 --normalize-inputs --head-gain 0.01 --head-fp32 --rwkv-optimizer
 
 timeout 1h uv run --no-sync python examples/models/rwkv7/forecast.py evaluate \
   --checkpoint "$FORECAST_RUN/best-median-forecast.pt" --data "$FORECAST_DATA" \
