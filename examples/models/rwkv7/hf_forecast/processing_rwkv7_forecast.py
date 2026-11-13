@@ -78,13 +78,17 @@ def prepare_features(
     if timestamps.shape != (len(bars),) or market.shape != (len(bars), 3):
         raise ValueError("timestamps and market must align with every raw OHLCV bar.")
     minute = timestamps.astype("datetime64[m]").astype(np.int64) % 1440
+    step = np.diff(timestamps)
+    # 11:30 and 13:01 are consecutive trading minutes, as in dataset preparation.
+    lunch = (minute[:-1] == 690) & (minute[1:] >= 780) & (minute[1:] <= 781) & (step <= np.timedelta64(91, "m"))
     if (
         np.isnat(timestamps).any()
         or np.any(timestamps != timestamps.astype("datetime64[m]"))
-        or np.any(np.diff(timestamps) != np.timedelta64(1, "m"))
-        or not (np.all((minute >= 570) & (minute <= 690)) or np.all((minute >= 780) & (minute <= 900)))
+        or np.any((step != np.timedelta64(1, "m")) & ~lunch)
+        or not np.all(((minute >= 570) & (minute <= 690)) | ((minute >= 780) & (minute <= 900)))
+        or np.any(timestamps.astype("datetime64[D]") != timestamps[0].astype("datetime64[D]"))
     ):
-        raise ValueError("Use one contiguous one-minute morning or afternoon session in Shanghai local time.")
+        raise ValueError("Use contiguous one-minute bars from one trading day in Shanghai local time.")
     opening, high, low, close, volume = bars.T
     if (
         not np.isfinite(bars).all()

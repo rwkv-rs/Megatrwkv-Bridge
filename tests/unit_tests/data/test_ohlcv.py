@@ -1,6 +1,7 @@
 """Numerical feature inversion and temporal isolation of OHLCV windows."""
 
 import json
+import pathlib
 
 import numpy as np
 import pytest
@@ -438,6 +439,72 @@ def test_windows_without_price_movement_carry_no_loss(tmp_path):
     assert not flat["loss_mask"].any() and flat["labels"].any()
     # The second window's history contains the resuming bar, so it is kept.
     assert moving["loss_mask"].all()
+
+
+def test_evaluation_inputs_use_the_checkpoint_feature_columns(prepared, tmp_path, monkeypatch):
+    """evaluate must build model inputs from the columns the checkpoint trained on."""
+    import runpy
+    from types import SimpleNamespace
+
+    import torch
+
+    from megatron.bridge.data.datasets.ohlcv import OHLCVQuantileWindowDataset, manifest_digest
+    from megatron.bridge.data.datasets.ohlcv_covariates import prepare_covariates
+
+    _, root = prepared
+    covariates = tmp_path / "covariates"
+    prepare_covariates(root, covariates, workers=1)
+    columns = [0, 1, 2, 3, 4, 19]
+    entry = pathlib.Path(__file__).resolve().parents[3] / "examples/models/rwkv7/forecast_quantile.py"
+    evaluate_quantiles = runpy.run_path(str(entry))["evaluate_quantiles"]
+    levels = tuple(i / 10 for i in range(1, 10))
+    payload = {
+        "step": 7,
+        "run": {
+            "manifest_sha256": manifest_digest(root),
+            "seed": 1234,
+            "covariates": str(covariates),
+            "covariates_sha256": manifest_digest(covariates),
+            "hf_config": {
+                "context_length": 3,
+                "forecast_feature_columns": columns,
+                "forecast_target_quantiles": [[0.0] * 9] * 4,
+            },
+        },
+    }
+    seen = []
+
+    class Model:
+        horizon, quantile_levels, volatility_floor = 4, levels, None
+        input_size = len(columns)
+
+        def predict_quantiles(self, inputs, *, fix_quantile_crossing=True):
+            seen.append(tuple(inputs.shape))
+            return torch.zeros(len(inputs), self.horizon, len(levels))
+
+    (tmp_path / "forecast.pt").write_bytes(b"weights")
+    args = SimpleNamespace(
+        data=root,
+        split="test",
+        horizon=4,
+        max_windows=4,
+        windows=None,
+        output=tmp_path / "evaluation/metrics.json",
+        checkpoint=tmp_path / "forecast.pt",
+        covariates=covariates,
+        pvw_cache=None,
+        baseline_paths=None,
+        direct_baseline_paths=None,
+        metrics_only=True,
+    )
+    evaluate_quantiles(args, Model(), payload)
+    # Without the checkpoint columns this would be the full 23-channel cache.
+    assert seen and all(shape[-1] == len(columns) for shape in seen)
+    report = json.loads(args.output.read_text())
+    assert "movement_free_windows" in report and "point_excluding_movement_free" in report
+    # The conditional reference still reads volatility_60 from every covariate.
+    full = OHLCVQuantileWindowDataset(root, split="test", seq_length=3, horizon=4, covariates=covariates)
+    assert full[0]["features"].shape[-1] == 23
 
 
 @pytest.mark.parametrize("with_pvw", [False, True])

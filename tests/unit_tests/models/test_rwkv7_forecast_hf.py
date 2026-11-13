@@ -47,6 +47,40 @@ def test_standalone_features_match_training_exactly(length):
 
 
 @pytest.mark.unit
+def test_features_span_the_lunch_break_but_reject_other_gaps():
+    rng = np.random.default_rng(7)
+    # 10:26 through 13:30: 65 morning bars, then the afternoon session.
+    morning = np.datetime64("2026-11-06T10:26") + np.arange(65) * np.timedelta64(1, "m")
+    afternoon = np.datetime64("2026-11-06T13:01") + np.arange(30) * np.timedelta64(1, "m")
+    stamps = np.concatenate((morning, afternoon))
+    close = 10 * np.exp(np.cumsum(rng.normal(0, 0.001, len(stamps))))
+    opening = np.concatenate((close[:1], close[:-1]))
+    bars = np.column_stack(
+        (
+            opening,
+            np.maximum(opening, close) + 0.02,
+            np.minimum(opening, close) - 0.02,
+            close,
+            rng.integers(1, 100000, len(stamps)),
+        )
+    )
+    market = market_statistics(rng.normal(0, 0.1, (len(stamps), 8)))
+    features, anchor = prepare_features(bars, stamps, market)
+    encoded = encode_bars(bars)
+    expected = forecast_covariates(encoded, stamps[1:], np.array([[0, len(encoded), 0]]), market[1:])
+    np.testing.assert_array_equal(features, expected[-64:])
+    assert anchor == close[-1]
+    # A missing 13:01 bar is an ordinary gap, and two days are not one session.
+    gap = np.delete(stamps, 65)
+    with pytest.raises(ValueError, match="one trading day"):
+        prepare_features(np.delete(bars, 65, axis=0), gap, np.delete(market, 65, axis=0))
+    crossing = stamps.copy()
+    crossing[65:] += np.timedelta64(1, "D")
+    with pytest.raises(ValueError, match="one trading day"):
+        prepare_features(bars, crossing, market)
+
+
+@pytest.mark.unit
 def test_market_aggregate_counts_only_completed_available_bars():
     result = market_statistics(np.array([[0.1, -0.1, np.nan, 0], [np.nan, 0.2, 0.2, np.nan]]))
     np.testing.assert_allclose(result, [[0, np.sqrt(0.02 / 3), 1 / 3], [0.2, 0, 1]], atol=1e-8)

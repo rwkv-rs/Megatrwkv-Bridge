@@ -118,6 +118,9 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
             raise ValueError("PVW cache identity differs from the checkpoint.")
     elif pvw_cache is not None:
         raise ValueError("This checkpoint does not use a PVW cache.")
+    # The checkpoint records which covariate columns reach the model; market
+    # aggregates, for instance, are excluded from training inputs.
+    feature_columns = payload["run"]["hf_config"].get("forecast_feature_columns")
     dataset = OHLCVQuantileWindowDataset(
         args.data,
         split=args.split,
@@ -126,6 +129,15 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
         stride=stride,
         covariates=covariates,
         pvw_cache=pvw_cache,
+        feature_columns=feature_columns,
+    )
+    # A second view keeps every covariate for the conditional reference baseline.
+    reference_dataset = (
+        OHLCVQuantileWindowDataset(
+            args.data, split=args.split, seq_length=context, horizon=horizon, stride=stride, covariates=covariates
+        )
+        if covariates is not None
+        else dataset
     )
     if not args.windows:
         indices = np.linspace(0, len(dataset) - 1, min(args.max_windows, len(dataset)), dtype=np.int64)
@@ -134,7 +146,7 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
     fixed = np.random.default_rng(payload["run"]["seed"]).choice(len(windows), min(8, len(windows)), replace=False)
     inputs_list, anchors, actual, histories, times, identities = [], [], [], [], [], []
     for row in windows:
-        info, start, arrays = dataset.window(row["index"])
+        info, start, arrays = reference_dataset.window(row["index"])
         end = start + context
         identity = {
             "exchange": info["exchange"],
@@ -155,11 +167,13 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
         identities.append(identity)
     anchor = np.asarray(anchors)
     truth = np.asarray(actual)
-    if pvw_cache is not None:
+    if pvw_cache is not None or feature_columns is not None:
         samples = dataset.__getitems__([row["index"] for row in windows])
         all_inputs = np.stack([sample["features"] for sample in samples])
     else:
         all_inputs = np.asarray(inputs_list)
+    if all_inputs.shape[-1] != model.input_size:
+        raise ValueError(f"Built {all_inputs.shape[-1]} input channels for a {model.input_size}-channel checkpoint.")
     raw = []
     for begin in range(0, len(all_inputs), 256):
         inputs = torch.from_numpy(all_inputs[begin : begin + 256]).cuda()
@@ -258,6 +272,8 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
             }
             for key in np.unique(keys)
         }
+    # The trained mask reads the history alone; close_return is channel 1.
+    movement_free = (np.asarray(inputs_list)[:, :, 1] == 0).all(axis=-1)
     model_error = target[..., None] - ordered
     empirical_error = target[..., None] - empirical
     pinball_difference = (
@@ -322,6 +338,19 @@ def evaluate_quantiles(args: argparse.Namespace, model: RWKV7ForecastModel, payl
         },
         "raw_crossing_fraction": float((np.diff(raw_array, axis=-1) < 0).any(-1).mean()),
         "point": point,
+        # Training and native validation mask windows whose history holds no
+        # price movement. Scoring every window keeps these numbers comparable
+        # with earlier reports; the same scores over the trained subset make the
+        # selection criterion and this report answer the same question.
+        "movement_free_windows": int(movement_free.sum()),
+        "point_excluding_movement_free": {
+            "direct_quantile": point_metrics(truth[~movement_free], median[~movement_free], anchor[~movement_free]),
+            "persistence": point_metrics(truth[~movement_free], persistence[~movement_free], anchor[~movement_free]),
+        },
+        "probabilistic_excluding_movement_free": {
+            "sorted": quantile_metrics(target[~movement_free], ordered[~movement_free], levels),
+            "empirical": quantile_metrics(target[~movement_free], empirical[~movement_free], levels),
+        },
         "probabilistic": {
             "raw": {
                 key: value
