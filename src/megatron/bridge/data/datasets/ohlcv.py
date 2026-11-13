@@ -546,10 +546,7 @@ class OHLCVQuantileWindowDataset(OHLCVWindowDataset):
         if self.packed is not None:
             features[valid], labels[valid] = self.packed.read(raw_indices)
             mask[valid] = 1
-            return [
-                {"features": values, "labels": target, "loss_mask": weights}
-                for values, target, weights in zip(features, labels, mask, strict=True)
-            ]
+            return self._samples(features, labels, mask)
         history = np.arange(self.seq_length)
         future = self.seq_length + np.arange(self.horizon)
         for positions, _, starts, arrays, denoised in self.iter_raw_windows(raw_indices):
@@ -565,6 +562,20 @@ class OHLCVQuantileWindowDataset(OHLCVWindowDataset):
             anchor = arrays["close"][starts + self.seq_length - 1]
             labels[rows] = PRICE_SCALE * np.log(arrays["close"][starts[:, None] + future] / anchor[:, None])
             mask[rows] = 1
+        return self._samples(features, labels, mask)
+
+    def _samples(
+        self, features: NDArray[np.float32], labels: NDArray[np.float32], mask: NDArray[np.float32]
+    ) -> list[dict[str, NDArray[np.float32]]]:
+        """Drop windows whose history holds no price movement at all.
+
+        A halted or limit-locked instrument produces 64 close returns that are
+        exactly zero, and its future closes repeat the same price, so the whole
+        label is zero. Such a window carries no forecasting signal and is not
+        tradeable. The test reads only the history, so it never selects windows
+        by their outcome, which would bias the learned quantiles outward.
+        """
+        mask[(features[..., 1] == 0).all(axis=-1)] = 0
         return [
             {"features": values, "labels": target, "loss_mask": weights}
             for values, target, weights in zip(features, labels, mask, strict=True)

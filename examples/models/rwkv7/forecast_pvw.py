@@ -116,7 +116,7 @@ def _fit_features(dataset: OHLCVQuantileWindowDataset, indices: NDArray[np.int64
     last[:, scaled] /= scale[:, None]
     inputs = np.column_stack((last[:, :base], last[:, candidates], np.log(scale)))
     names = [*FEATURE_NAMES, *(FORECAST_FEATURE_NAMES[i] for i in candidates), "log_return_scale"]
-    matrix = xgb.DMatrix(inputs.astype(np.float32), feature_names=names, nthread=16)
+    matrix = xgb.DMatrix(inputs.astype(np.float32), feature_names=names)
     levels = np.arange(1, 10) / 10
     scores = []
     for horizon, target in zip(horizons, targets.T, strict=True):
@@ -129,7 +129,6 @@ def _fit_features(dataset: OHLCVQuantileWindowDataset, indices: NDArray[np.int64
                 "max_depth": 4,
                 "eta": 0.05,
                 "seed": SEED,
-                "nthread": 16,
             },
             matrix,
             num_boost_round=256,

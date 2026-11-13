@@ -260,6 +260,16 @@ these inputs about 1.1-1.5 times wider in 2024 than in training (`lower_wick`
 differ by 3%. Volume, calendar and up-fraction channels are not rescaled.
 Standardization statistics are then estimated on the scaled inputs.
 
+Windows whose 64 historical close returns are all exactly zero carry a zero
+loss mask. A halted or limit-locked instrument repeats one price, so its whole
+label is zero and nothing is left to forecast; it is also not tradeable. This
+covers 4.02% of training windows and 1.14% of the frozen 2024 validation
+windows, 99.0% and 97.1% of which have an all-zero label, while flagging 0.04%
+of windows that do move. The test reads only the history, never the outcome:
+dropping windows because their future happened to be flat would select on the
+label and widen the learned quantiles. Native masking already normalizes the
+loss by the valid count, so the remaining windows keep their weight.
+
 Direct quantile training requires `--calibration-windows`. Calibration uses
 training windows only: `s_min` is the 5th percentile of their positive
 `RMS_64`, and each horizon/quantile bias starts from the empirical quantile of
@@ -420,7 +430,7 @@ indices for the native validation loader. `--exclude-dates old/windows.json`
 excludes complete dates previously inspected when freezing an independent test
 set. Existing 1024-window results remain a separate regression comparison.
 With histories and targets continuing through the lunch break, the 64+30 contract
-admits every origin from 10:34 to 14:30, 146 minutes per trading day, instead of
+admits every origin from 10:34 to 14:30, 147 minutes per trading day, instead of
 the 53 minutes of half-day windows. Windows frozen on a version-1 preparation
 index a different inventory; freeze new validation and test windows.
 
@@ -531,7 +541,12 @@ quantiles of `label / (RMS_64 * sqrt(h))` from final-bar covariates, with
 return-unit values divided by `RMS_64`. The five base channels and
 `log(RMS_64)` enter every booster as conditioning features because the model
 always receives them; the 11 covariates with the largest positive mean gain
-are kept. The earlier squared-error ranking of raw labels credited only mean
+are kept. `up_fraction_60` dominates this ranking (0.81 mean gain) because it
+also identifies movement-free windows: it counts strictly positive bars, so it
+correlates -0.93 with the share of zero-return bars, and those windows have an
+all-zero label. On live windows alone its share falls to 0.55 and `return_5`
+rises from 0.11 to 0.28. Training masks those windows, and the ranking keeps
+the full inventory so the selection stays reproducible from the cache alone. The earlier squared-error ranking of raw labels credited only mean
 predictors and dropped all four volatility covariates, which determine interval
 width. Cache manifest version 2 records this objective. The validation and test caches hold
 only frozen windows. Each VMD transform uses that origin's historical closes;

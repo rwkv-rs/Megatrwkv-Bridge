@@ -405,6 +405,41 @@ def test_pvw_cache_matches_raw_ids_and_masks_final_batch(prepared, tmp_path):
         frozen[0]
 
 
+def test_windows_without_price_movement_carry_no_loss(tmp_path):
+    from megatron.bridge.data.datasets.ohlcv import OHLCVQuantileWindowDataset
+
+    source = tmp_path / "source"
+    file = source / "data/stock_1m/SZ/000002.parquet"
+    file.parent.mkdir(parents=True)
+    timestamps = np.datetime64("2023-12-29T09:30", "us") + np.arange(9) * np.timedelta64(1, "m")
+    # A halted instrument repeats one price, then resumes at bar 4.
+    close = np.full(len(timestamps), 10.0)
+    close[4:] = 10.5
+    table = pa.table(
+        {
+            "exchange": ["SZ"] * len(close),
+            "symbol": ["000002"] * len(close),
+            "timestamp": timestamps,
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume": np.zeros(len(close)),
+        }
+    )
+    pq.write_table(table, file)
+    root = tmp_path / "prepared"
+    prepare_ohlcv(source, root, train_end="2024-01-01", validation_end="2025-01-01", revision="test-revision")
+    dataset = OHLCVQuantileWindowDataset(root, split="train", seq_length=3, horizon=4)
+    assert dataset.num_windows == 2
+    flat, moving = dataset.__getitems__([0, 1])
+    # The first window's history is flat, so it is masked even though its own
+    # future moves: the test reads the history alone, never the outcome.
+    assert not flat["loss_mask"].any() and flat["labels"].any()
+    # The second window's history contains the resuming bar, so it is kept.
+    assert moving["loss_mask"].all()
+
+
 @pytest.mark.parametrize("with_pvw", [False, True])
 def test_packed_windows_match_memory_mapped_windows(prepared, tmp_path, with_pvw):
     from megatron.bridge.data.datasets.ohlcv import OHLCVQuantileWindowDataset, manifest_digest
