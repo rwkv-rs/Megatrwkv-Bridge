@@ -35,6 +35,14 @@ COVARIATE_NAMES = (
     *MARKET_FEATURE_NAMES,
 )
 FORECAST_FEATURE_NAMES = (*FEATURE_NAMES, *COVARIATE_NAMES)
+# Channels in close-return units, including the PVW denoised relative log price.
+# Direct-quantile models divide them by each window's close-return RMS.
+RETURN_FEATURE_NAMES = (
+    *FEATURE_NAMES[:4],
+    *tuple(f"return_{n}" for n in (5, 15, 30, 60)),
+    *tuple(f"volatility_{n}" for n in (5, 15, 30, 60)),
+    "pvw_log_close",
+)
 
 
 def rolling_mean(values: NDArray[Any], starts: NDArray[Any], window: int) -> NDArray[np.float64]:
@@ -131,7 +139,7 @@ def prepare_covariates(root: Path, output: Path, *, workers: int) -> None:
                 "feature_names": FORECAST_FEATURE_NAMES,
                 "first_market_minute": int(first),
                 "universe": "all instruments in the source manifest; equal-weight completed-bar returns",
-                "rolling_boundary": "source segment, including split/session/gap boundaries",
+                "rolling_boundary": "source segment, including split, overnight and gap boundaries",
             },
             indent=2,
         )

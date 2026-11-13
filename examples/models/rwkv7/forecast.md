@@ -29,8 +29,12 @@ The five predicted fields are `open`, `high`, `low`, `close`, `volume`.
 `turnover` is excluded from the inputs and target. Prices remain unadjusted
 CNY/share; volume is in shares. Naive timestamps retain the source's UTC+8
 interpretation. Preparation rejects mixed-instrument files and unordered or
-duplicate timestamps. Invalid OHLCV rows, missing minutes, lunch and overnight
-gaps terminate a sequence. Zero volume is valid. No missing bars are filled.
+duplicate timestamps. Invalid OHLCV rows, missing minutes and overnight gaps
+terminate a sequence. The 11:30 bar and the 13:01 bar are consecutive trading
+minutes, so a sequence continues through the lunch break and covers one trading
+day; preparation records this as manifest version 2. Overnight gaps, which also
+contain dividend and split adjustments in unadjusted prices, still cut it. Zero
+volume is valid. No missing bars are filled.
 
 Prepare a **new** destination, with exclusive chronological split boundaries:
 
@@ -44,9 +48,9 @@ timeout 24h uv run --no-sync python examples/models/rwkv7/forecast.py prepare \
 Training uses dates before 2024-01-01; validation uses 2024; test uses dates
 starting 2025-01-01. These are example experiment boundaries. Choose them for
 the downloaded snapshot before comparing models. Windows and their complete
-targets remain inside one split, instrument and continuous session. Independent
+targets remain inside one split, instrument and trading day. Independent
 windows reset all recurrent state. Context length is measured in minute bars;
-64 is a small initial setting that fits within a continuous session.
+64 is a small initial setting that fits within a trading day.
 
 Preparation processes one instrument per worker and writes float32 encoded
 features, float64 closing prices and timestamps as memory-mapped NumPy shards.
@@ -150,7 +154,7 @@ timeout 10m uv run --no-sync python examples/models/rwkv7/forecast.py predict \
 
 The default context uses up to the training context length, plus one raw anchor
 bar. A partial session uses its available shorter context, requiring at least
-two raw bars; history never crosses a session gap. The CSV records instrument
+two raw bars; history never crosses an overnight or missing-minute gap. The CSV records instrument
 identity, historical context end, actual context length, one-based forecast
 step, and OHLCV. Steps are ordered future bars; the output assigns no future
 calendar timestamps. Training windows cover continuous intraday minutes, so use
@@ -246,11 +250,21 @@ volatility rises: the 2024 `q10-q90` span of 30-minute returns was 164 bp versus
 80% coverage fell to 61%. Validation and the exported best checkpoints are
 scored on returns, independent of the training scale.
 
+Inputs share that scale. Return-unit channels (open/close returns, wicks,
+trailing returns and RMS returns, and the PVW relative log price; listed in
+`forecast_scaled_features`) are divided by the same floored `RMS_64`, and
+`log(RMS_64)` is appended as one more input channel, as Chronos-Bolt and DeepAR
+scale context and target together. Fixed training-period statistics alone left
+these inputs about 1.1-1.5 times wider in 2024 than in training (`lower_wick`
+1.48, `volatility_60` 1.35, `close_return` 1.14), while the scaled labels
+differ by 3%. Volume, calendar and up-fraction channels are not rescaled.
+Standardization statistics are then estimated on the scaled inputs.
+
 Direct quantile training requires `--calibration-windows`. Calibration uses
 training windows only: `s_min` is the 5th percentile of their positive
 `RMS_64`, and each horizon/quantile bias starts from the empirical quantile of
 the scaled labels, so the initial model is the volatility-scaled empirical
-forecast. Historical input statistics are estimated separately. Only complete
+forecast. Only complete
 context-plus-horizon windows enter this task. Use a fixed step budget; the
 next-bar epoch/tail semantics apply to the original task.
 
@@ -374,7 +388,7 @@ snapshot. It retains the five original inputs and appends 18 covariates:
 calendar phase/session, trailing 5/15/30/60-bar returns and RMS returns,
 relative volume, trailing up-bar fraction, and contemporaneous equal-weight
 market return, cross-sectional volatility and up-stock fraction. Every rolling
-calculation resets at the source segment, including session and split boundaries.
+calculation resets at the source segment, including overnight and split boundaries.
 The market universe is the source manifest's instrument inventory. Only completed
 bars at the input timestamp enter its aggregate. The cache manifest records the
 source digest, feature order and temporal contract.
@@ -405,8 +419,10 @@ include the stride, raw index, instrument and timestamps; NPY stores the same
 indices for the native validation loader. `--exclude-dates old/windows.json`
 excludes complete dates previously inspected when freezing an independent test
 set. Existing 1024-window results remain a separate regression comparison.
-The current same-session 64+30 contract admits 53 origin minutes in this snapshot;
-opening and cross-session forecasts require a separate history-boundary change.
+With histories and targets continuing through the lunch break, the 64+30 contract
+admits every origin from 10:34 to 14:30, 146 minutes per trading day, instead of
+the 53 minutes of half-day windows. Windows frozen on a version-1 preparation
+index a different inventory; freeze new validation and test windows.
 
 Add `--covariates "$FORECAST_COVARIATES"` and
 `--validation-indices "$FORECAST_WINDOWS/validation.npy"` to direct-quantile
@@ -507,7 +523,17 @@ errors. The full check log is retained with the runtime artifacts.
 The PVW experiment keeps the 64 completed bars, 30 future closes and nine
 quantiles of the direct-quantile task. It fits POA/VMD and XGBoost on training
 windows, then caches one 64-point denoised relative log-price sequence for
-every eligible stride-one training origin. The validation and test caches hold
+every eligible stride-one training origin.
+
+XGBoost ranks the non-market covariates for the model's own objective: one
+`reg:quantileerror` booster per horizon (1, 5, 15, 30) fits the 0.1-0.9
+quantiles of `label / (RMS_64 * sqrt(h))` from final-bar covariates, with
+return-unit values divided by `RMS_64`. The five base channels and
+`log(RMS_64)` enter every booster as conditioning features because the model
+always receives them; the 11 covariates with the largest positive mean gain
+are kept. The earlier squared-error ranking of raw labels credited only mean
+predictors and dropped all four volatility covariates, which determine interval
+width. Cache manifest version 2 records this objective. The validation and test caches hold
 only frozen windows. Each VMD transform uses that origin's historical closes;
 the raw future closes remain the labels. The transform uses signed Pearson
 correlation 0.1 and three Haar levels with MAD/universal soft thresholding.
@@ -522,10 +548,15 @@ timeout 48h uv run --no-sync --with xgboost-cpu==3.2.0 python -m torch.distribut
   --validation-indices "$FORECAST_VALIDATION" --test-windows "$FORECAST_TEST" \
   --batch-size "$PVW_BATCH" --output "$FORECAST_PVW"
 
+timeout 2h uv run --no-sync python examples/models/rwkv7/forecast.py pack \
+  --data "$FORECAST_DATA" --covariates "$FORECAST_COVARIATES" --pvw-cache "$FORECAST_PVW" \
+  --output "$FORECAST_PACKED" --workers 16
+
 timeout 168h uv run --no-sync python -m torch.distributed.run --standalone --nproc_per_node=8 \
   examples/models/rwkv7/forecast.py train --task direct_quantile --epochs 1 \
   --forecast-architecture cnn_rwkv_attention --config examples/models/rwkv7/forecast-l12-d768.json \
   --data "$FORECAST_DATA" --covariates "$FORECAST_COVARIATES" --pvw-cache "$FORECAST_PVW" \
+  --packed-train "$FORECAST_PACKED" \
   --validation-indices "$FORECAST_VALIDATION" --output "$FORECAST_RUN" \
   --context 64 --forecast-horizon 30 --global-batch-size 12288 --micro-batch-size "$FORECAST_MICROBATCH" \
   --learning-rate 1e-4 --warmup-steps 100 --eval-iters 1 --eval-interval 500 --save-interval 500 \
@@ -538,7 +569,22 @@ timeout 1h uv run --no-sync python examples/models/rwkv7/forecast.py evaluate \
 ```
 
 Retry a partially written cache with the same command and output directory.
-Completed instrument shards are reused. Resume training by adding
+Completed instrument shards are reused.
+
+`pack` writes the training windows as a Megatron Core `IndexedDataset`
+(`train.bin`, `train.idx`) plus `manifest.json`. Each sequence is one trading
+day of one instrument: its float32 `[bars, columns + 1]` rows, whose last
+column is `100 * log(close / first close)`, followed by the day's
+`[windows, 64]` PVW rows; each instrument is one document. Packed window `i` is
+raw window `i`, so frozen indices and calibration are unchanged. A training
+window is two positioned reads from one file, read without mmap. Random windows
+over per-instrument mmaps read four files per window and triggered page
+readahead on each: the earlier L12D768 run read 3.8-4.7 GiB/s from the RAID while
+GPUs were 66% busy. Features and PVW values are copied exactly; labels differ
+from the float64 log ratios by at most about `2e-6` (0.0002 bp). The manifest
+records the source, covariate and PVW cache digests, input columns and window
+count, and training rejects a packed directory that does not match them.
+Validation, calibration and evaluation read the original caches. Resume training by adding
 `--resume "$FORECAST_RUN/checkpoints"` to the original command. The full-epoch
 direct-quantile mode masks the unused rows in the last global batch.
 

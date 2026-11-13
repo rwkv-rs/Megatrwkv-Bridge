@@ -42,6 +42,21 @@ def prepare(args: argparse.Namespace) -> None:
         logger.info("%s: %d segments, %d encoded bars", split, counts["segments"], counts["bars"])
 
 
+def training_feature_columns(covariates: Path | None, pvw_cache: Path | None) -> list[int] | None:
+    """Return the covariate-cache columns that enter the model, or None without covariates."""
+    if covariates is None:
+        return None
+    from megatron.bridge.data.datasets.ohlcv_covariates import FORECAST_FEATURE_NAMES, MARKET_FEATURE_NAMES
+
+    columns = list(range(len(FORECAST_FEATURE_NAMES)))
+    if pvw_cache is not None:
+        columns = json.loads((pvw_cache / "manifest.json").read_text())["columns"]
+    # Market aggregates are shared by every instrument at a minute; models
+    # memorized training-period market moves from them and lost the gain
+    # out of sample, so they never enter the model.
+    return [i for i in columns if FORECAST_FEATURE_NAMES[i] not in MARKET_FEATURE_NAMES]
+
+
 def train(args: argparse.Namespace) -> None:
     """Train with Bridge's optimizer, scheduler, DDP and distributed checkpoints."""
     from transformers import RwkvConfig
@@ -70,9 +85,8 @@ def train(args: argparse.Namespace) -> None:
         hf.forecast_horizon = args.forecast_horizon
         hf.forecast_quantiles = [i / 10 for i in range(1, 10)]
     if args.covariates:
-        from megatron.bridge.data.datasets.ohlcv_covariates import FORECAST_FEATURE_NAMES, MARKET_FEATURE_NAMES
+        from megatron.bridge.data.datasets.ohlcv_covariates import FORECAST_FEATURE_NAMES
 
-        source_columns = list(range(len(FORECAST_FEATURE_NAMES)))
         if pvw_cache:
             metadata = json.loads((pvw_cache / "manifest.json").read_text())
             if (
@@ -81,13 +95,7 @@ def train(args: argparse.Namespace) -> None:
             ):
                 raise ValueError("Validation indices do not match the PVW cache.")
             hf.forecast_pvw = {key: metadata[key] for key in ("modes", "alpha", "columns")}
-            source_columns = metadata["columns"]
-        # Market aggregates are shared by every instrument at a minute; models
-        # memorized training-period market moves from them and lost the gain
-        # out of sample, so they never enter the model.
-        hf.forecast_feature_columns = [
-            i for i in source_columns if FORECAST_FEATURE_NAMES[i] not in MARKET_FEATURE_NAMES
-        ]
+        hf.forecast_feature_columns = training_feature_columns(args.covariates, pvw_cache)
         hf.forecast_feature_names = [FORECAST_FEATURE_NAMES[i] for i in hf.forecast_feature_columns]
         if pvw_cache:
             hf.forecast_feature_names.append(metadata["feature_names"][-1])
@@ -115,13 +123,6 @@ def train(args: argparse.Namespace) -> None:
             keep_tail=not direct,
             seed=args.seed,
         )
-        total, feature_total, feature_squares = (
-            np.zeros(getattr(hf, "forecast_input_size", 5), dtype=np.float64) for _ in range(3)
-        )
-        count = 0
-        targets = []
-        calibration_features = []
-        volatility_features = []
         indices = (
             np.arange(args.calibration_windows, dtype=np.int64) * calibration.num_windows // args.calibration_windows
         )
@@ -129,44 +130,45 @@ def train(args: argparse.Namespace) -> None:
             reference_features = np.empty((len(indices), 23), dtype=np.float32)
             for positions, _, starts, arrays, _ in calibration.iter_raw_windows(calibration.raw_indices(indices)):
                 reference_features[positions] = arrays["features"][starts + args.context - 1]
-        samples = calibration.__getitems__(indices.tolist()) if pvw_cache else (calibration[int(i)] for i in indices)
-        for sample in samples:
-            mask = sample["loss_mask"].astype(bool)
-            if direct:
-                targets.append(sample["labels"])
-                calibration_features.append(sample["features"][-1])
-                volatility_features.append(sample["features"])
-            else:
-                total += sample["labels"][mask].sum(axis=0, dtype=np.float64)
-            if args.normalize_inputs:
-                features = (sample["features"] if direct else sample["features"][mask]).astype(np.float64)
-                feature_total += features.sum(axis=0)
-                feature_squares += np.square(features).sum(axis=0)
-            count += len(sample["features"]) if direct else int(mask.sum())
+        samples = calibration.__getitems__(indices.tolist()) if pvw_cache else [calibration[int(i)] for i in indices]
         hf.forecast_initialization = "calibrated"
+        hf.forecast_head_gain = args.head_gain
         if direct:
             import torch
 
-            from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import forecast_window_scale
+            from megatron.bridge.data.datasets.ohlcv import FEATURE_NAMES
+            from megatron.bridge.data.datasets.ohlcv_covariates import RETURN_FEATURE_NAMES
+            from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import (
+                forecast_scaled_inputs,
+                forecast_window_rms,
+                forecast_window_scale,
+            )
 
+            windows = torch.from_numpy(np.stack([sample["features"] for sample in samples]))
+            targets = np.stack([sample["labels"] for sample in samples])
+            calibration_features = windows[:, -1].numpy()
             # Quantiles are learned relative to each window's own volatility,
             # so intervals follow volatility regimes absent from training.
-            raw_features = torch.from_numpy(np.stack(volatility_features))
-            rms = forecast_window_scale(raw_features, floor=0, horizon=1).flatten()
+            rms = forecast_window_rms(windows, floor=0)
             # The floor bounds scaled errors after flat, untraded histories.
             hf.forecast_volatility_floor = float(torch.quantile(rms[rms > 0], 0.05))
-            scale = forecast_window_scale(
-                raw_features, floor=hf.forecast_volatility_floor, horizon=args.forecast_horizon
-            )
-            scaled_targets = np.asarray(targets) / scale.numpy()
+            scale = forecast_window_scale(windows, floor=hf.forecast_volatility_floor, horizon=args.forecast_horizon)
+            scaled_targets = targets / scale.numpy()
             hf.forecast_target_quantiles = np.quantile(scaled_targets, hf.forecast_quantiles, axis=0).T.tolist()
+            names = getattr(hf, "forecast_feature_names", list(FEATURE_NAMES))
+            hf.forecast_scaled_features = [i for i, name in enumerate(names) if name in RETURN_FEATURE_NAMES]
+            mask = torch.tensor([i in hf.forecast_scaled_features for i in range(len(names))])
+            model_inputs = forecast_scaled_inputs(windows, mask, floor=hf.forecast_volatility_floor)
+            values = model_inputs.reshape(-1, model_inputs.shape[-1]).double().numpy()
         else:
-            hf.forecast_target_mean = (total / count).tolist()
-        hf.forecast_head_gain = args.head_gain
-        logger.info("Training-only head calibration: %d input bars", count)
+            values = np.concatenate([sample["features"][sample["loss_mask"].astype(bool)] for sample in samples])
+            labels = np.concatenate([sample["labels"][sample["loss_mask"].astype(bool)] for sample in samples])
+            hf.forecast_target_mean = labels.astype(np.float64).mean(axis=0).tolist()
+        logger.info("Training-only head calibration: %d input bars", len(values))
         if args.normalize_inputs:
-            mean = feature_total / count
-            std = np.sqrt(np.maximum(feature_squares / count - mean**2, 0))
+            values = values.astype(np.float64)
+            mean = values.mean(axis=0)
+            std = values.std(axis=0)
             std[std == 0] = 1
             hf.forecast_input_mean = mean.tolist()
             hf.forecast_input_std = std.tolist()
@@ -214,6 +216,9 @@ def train(args: argparse.Namespace) -> None:
     if pvw_cache is not None:
         run["pvw_cache"] = str(pvw_cache)
         run["pvw_cache_sha256"] = manifest_digest(pvw_cache)
+    if args.packed_train is not None:
+        run["packed_train"] = str(args.packed_train)
+        run["packed_train_sha256"] = manifest_digest(args.packed_train)
     if args.data_workers is not None:
         run["data_workers"] = args.data_workers
     if args.validation_indices is not None:
@@ -269,6 +274,7 @@ def train(args: argparse.Namespace) -> None:
         covariates=args.covariates,
         validation_indices=args.validation_indices,
         pvw_cache=pvw_cache,
+        packed_train=args.packed_train,
         data_workers=args.data_workers,
     )
     cfg.checkpoint.load = str(args.resume) if args.resume else None
@@ -533,6 +539,7 @@ def main() -> None:
     training.add_argument("--covariates", type=Path, help="Prepared past-only market and temporal feature cache")
     training.add_argument("--validation-indices", type=Path, help="Frozen stride-one validation index NPY")
     training.add_argument("--pvw-cache", type=Path, help="Frozen per-origin PVW feature cache")
+    training.add_argument("--packed-train", type=Path, help="Indexed .bin/.idx training windows from the pack command")
     training.add_argument("--forecast-architecture", choices=("cnn_rwkv_attention",))
     training.add_argument("--data-workers", type=int, help="Persistent DataLoader workers per rank")
     training.set_defaults(handler=train)
@@ -568,6 +575,34 @@ def main() -> None:
         prepare_pvw(args)
 
     pvw.set_defaults(handler=cache_pvw)
+    packing = commands.add_parser("pack", help="Pack direct-quantile training windows into .bin/.idx")
+    packing.add_argument("--data", type=Path, required=True)
+    packing.add_argument("--covariates", type=Path, help="Covariate cache used for training")
+    packing.add_argument("--pvw-cache", type=Path, help="PVW cache used for training")
+    packing.add_argument("--output", type=Path, required=True)
+    packing.add_argument("--context", type=int, default=64)
+    packing.add_argument("--forecast-horizon", type=int, default=30)
+    packing.add_argument("--workers", type=int, required=True)
+
+    def pack_windows(args: argparse.Namespace) -> None:
+        from megatron.bridge.data.datasets.ohlcv import OHLCVQuantileWindowDataset
+        from megatron.bridge.data.datasets.ohlcv_indexed import pack_quantile_windows
+
+        pack_quantile_windows(
+            OHLCVQuantileWindowDataset(
+                args.data,
+                split="train",
+                seq_length=args.context,
+                horizon=args.forecast_horizon,
+                covariates=args.covariates,
+                pvw_cache=args.pvw_cache,
+                feature_columns=training_feature_columns(args.covariates, args.pvw_cache),
+            ),
+            args.output,
+            workers=args.workers,
+        )
+
+    packing.set_defaults(handler=pack_windows)
     covariates = commands.add_parser("prepare-covariates", help="Cache past-only temporal/market covariates")
     covariates.add_argument("--data", type=Path, required=True)
     covariates.add_argument("--output", type=Path, required=True)
@@ -603,6 +638,8 @@ def main() -> None:
             parser.error("Counts, window lengths and worker count must be positive")
     if args.command == "prepare-pvw" and args.batch_size <= 0:
         parser.error("PVW batch size must be positive")
+    if args.command == "pack" and (args.workers <= 0 or (args.pvw_cache and not args.covariates)):
+        parser.error("Packing requires positive workers, and PVW requires its covariates")
     if args.command == "train":
         if args.pvw_cache is not None and (
             args.task != "direct_quantile"
@@ -614,6 +651,8 @@ def main() -> None:
             parser.error("PVW requires direct_quantile, 64/30 windows, covariates and frozen validation indices")
         if args.forecast_architecture is not None and args.task != "direct_quantile":
             parser.error("CNN with feature attention requires direct_quantile")
+        if args.packed_train is not None and args.task != "direct_quantile":
+            parser.error("--packed-train requires direct_quantile")
         if args.data_workers is not None and args.data_workers < 0:
             parser.error("Data worker count cannot be negative")
         if (args.covariates or args.validation_indices) and args.task != "direct_quantile":

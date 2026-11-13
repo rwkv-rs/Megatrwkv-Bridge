@@ -27,7 +27,7 @@ class RWKV7ForecastConfig(RWKV7ModelConfig):
         total = float(super()._get_num_floating_point_operations_with_runtime_stats(batch_size, seqlen_sum, **kwargs))
         tokens = seqlen_sum if seqlen_sum is not None else batch_size * self.seq_length
         # Remove the token LM head; add continuous input and task output projections.
-        inputs = self.hf_config.get("forecast_input_size", 5)
+        inputs = self.hf_config.get("forecast_input_size", 5) + ("forecast_scaled_features" in self.hf_config)
         total += float(tokens * 6 * self.hidden_size * (inputs - self.vocab_size))
         if self.hf_config.get("forecast_task", "next_bar") == "direct_quantile":
             outputs = self.hf_config["forecast_horizon"] * len(self.hf_config["forecast_quantiles"])
@@ -89,11 +89,15 @@ class RWKV7ForecastModel(RWKV7Model):
         self.hf = self.hf.model
         self.hf.embed_tokens = nn.Identity()
         self.input_size = getattr(self.hf.config, "forecast_input_size", 5)
+        # Return-unit inputs are divided by the window's return RMS, whose log
+        # is appended as one more channel.
+        scaled_features = getattr(self.hf.config, "forecast_scaled_features", None)
+        model_inputs = self.input_size + (scaled_features is not None)
         self.feature_mixer: ForecastFeatureMixer | None = None
         if getattr(self.hf.config, "forecast_architecture", "linear") == "cnn_rwkv_attention":
-            self.feature_mixer = ForecastFeatureMixer(self.input_size, model_config.hidden_size)
+            self.feature_mixer = ForecastFeatureMixer(model_inputs, model_config.hidden_size)
         else:
-            self.input_projection = nn.Linear(self.input_size, model_config.hidden_size, dtype=torch.bfloat16)
+            self.input_projection = nn.Linear(model_inputs, model_config.hidden_size, dtype=torch.bfloat16)
         self.direct_quantile = getattr(self.hf.config, "forecast_task", "next_bar") == "direct_quantile"
         if self.direct_quantile:
             self.horizon = self.hf.config.forecast_horizon
@@ -108,6 +112,17 @@ class RWKV7ForecastModel(RWKV7Model):
         # Chronos-Bolt-style instance scaling: the head predicts quantiles in
         # units of each window's historical close-return RMS times sqrt(h).
         self.volatility_floor = getattr(self.hf.config, "forecast_volatility_floor", None)
+        if scaled_features is None:
+            self.scaled_inputs = None
+        else:
+            self.register_buffer(
+                "scaled_inputs",
+                torch.tensor(
+                    [index in scaled_features for index in range(self.input_size)],
+                    device=self.output_projection.weight.device,
+                ),
+                persistent=False,
+            )
         self.normalize_inputs = hasattr(self.hf.config, "forecast_input_mean")
         if self.normalize_inputs:
             # Explicit BF16 storage matches native wrapping and standalone reload.
@@ -128,13 +143,13 @@ class RWKV7ForecastModel(RWKV7Model):
                 if self.feature_mixer is None:
                     weight = torch.empty(
                         model_config.hidden_size,
-                        self.input_size + 1,
+                        model_inputs + 1,
                         device=self.input_projection.weight.device,
                         dtype=torch.float32,
                     )
-                    nn.init.orthogonal_(weight, gain=(model_config.hidden_size / (self.input_size + 1)) ** 0.5)
-                    self.input_projection.weight.copy_(weight[:, : self.input_size])
-                    self.input_projection.bias.copy_(weight[:, self.input_size])
+                    nn.init.orthogonal_(weight, gain=(model_config.hidden_size / (model_inputs + 1)) ** 0.5)
+                    self.input_projection.weight.copy_(weight[:, :model_inputs])
+                    self.input_projection.bias.copy_(weight[:, model_inputs])
                 weight = torch.empty_like(self.output_projection.weight, dtype=torch.float32)
                 nn.init.orthogonal_(weight, gain=self.hf.config.forecast_head_gain)
                 self.output_projection.weight.copy_(weight)
@@ -165,6 +180,9 @@ class RWKV7ForecastModel(RWKV7Model):
             past_key_values: HF RWKV cache used only for autoregressive inference.
         """
         inputs = features.float()
+        if self.scaled_inputs is not None:
+            assert self.volatility_floor is not None
+            inputs = forecast_scaled_inputs(inputs, self.scaled_inputs, floor=self.volatility_floor)
         if self.normalize_inputs:
             inputs = (inputs - self.feature_mean.float()) / self.feature_std.float()
         inputs = inputs.to(self.output_projection.weight.dtype)
@@ -234,11 +252,27 @@ class RWKV7ForecastModel(RWKV7Model):
         return torch.cat(bars, dim=1)
 
 
+def forecast_window_rms(features: torch.Tensor, *, floor: float) -> torch.Tensor:
+    """Return each window's RMS of raw historical close returns, at least ``floor``."""
+    return features[..., 1].float().square().mean(dim=-1).sqrt().clamp_min(floor)
+
+
 def forecast_window_scale(features: torch.Tensor, *, floor: float, horizon: int) -> torch.Tensor:
     """Scale each horizon by the RMS of raw historical close returns and sqrt(h)."""
-    rms = features[..., 1].float().square().mean(dim=-1).sqrt().clamp_min(floor)
     steps = torch.arange(1, horizon + 1, device=features.device, dtype=torch.float32)
-    return rms.unsqueeze(-1) * steps.sqrt()
+    return forecast_window_rms(features, floor=floor).unsqueeze(-1) * steps.sqrt()
+
+
+def forecast_scaled_inputs(features: torch.Tensor, scaled: torch.Tensor, *, floor: float) -> torch.Tensor:
+    """Divide return-unit channels by the window RMS and append its log as a channel.
+
+    Inputs then share the output's per-window scale, as in Chronos-Bolt and
+    DeepAR, while the log scale retains the volatility level itself.
+    """
+    rms = forecast_window_rms(features, floor=floor)
+    divided = torch.where(scaled, features.float() / rms[:, None, None], features.float())
+    level = rms.log()[:, None, None].expand(-1, features.shape[1], 1)
+    return torch.cat((divided, level), dim=-1)
 
 
 def forecast_pinball(predictions: torch.Tensor, labels: torch.Tensor, levels: tuple[float, ...]) -> torch.Tensor:

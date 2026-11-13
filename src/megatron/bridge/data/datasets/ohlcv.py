@@ -146,7 +146,11 @@ def load_instrument(path: Path) -> tuple[str, str, NDArray[np.datetime64], NDArr
 
 
 def contiguous_segments(timestamps: NDArray[np.datetime64], bars: NDArray[np.float64]) -> list[tuple[int, int]]:
-    """Find valid one-minute runs, cutting at invalid rows and session gaps."""
+    """Find valid one-minute runs, cutting at invalid rows, missing minutes and overnight.
+
+    The 11:30 bar and the 13:00/13:01 bar are consecutive trading minutes, so a
+    run continues through the lunch break and covers the whole trading day.
+    """
     if not len(timestamps):
         return []
     minutes = timestamps.astype("datetime64[m]").astype(np.int64) % (24 * 60)
@@ -162,7 +166,9 @@ def contiguous_segments(timestamps: NDArray[np.datetime64], bars: NDArray[np.flo
         & in_session
         & aligned
     )
-    linked = np.diff(timestamps) == np.timedelta64(1, "m")
+    step = np.diff(timestamps)
+    lunch = (minutes[:-1] == 690) & (minutes[1:] >= 780) & (minutes[1:] <= 781) & (step <= np.timedelta64(91, "m"))
+    linked = (step == np.timedelta64(1, "m")) | lunch
     starts = np.flatnonzero(valid & ~np.concatenate(([False], valid[:-1] & linked)))
     ends = np.flatnonzero(valid & ~np.concatenate((valid[1:] & linked, [False]))) + 1
     return list(zip(starts.tolist(), ends.tolist()))
@@ -195,7 +201,8 @@ def prepare_ohlcv(
         raise ValueError("Expected a snapshot root containing data/stock_1m/{exchange}/{symbol}.parquet.")
     output.mkdir(parents=True, exist_ok=False)
     manifest: OHLCVManifest = {
-        "version": 1,
+        # Version 2 segments continue through the lunch break.
+        "version": 2,
         "source": "neigezhu/china-a-share-1min-ohlcv",
         "revision": revision,
         "train_end": train_end,
@@ -312,7 +319,7 @@ class OHLCVWindowDataset(Dataset[dict[str, NDArray[np.float32]]]):
         self.cycle_length = cycle_length
         manifest: OHLCVManifest = json.loads((self.root / "manifest.json").read_text())
         if (
-            manifest["version"] != 1
+            manifest["version"] not in (1, 2)
             or manifest["feature_names"] != list(FEATURE_NAMES)
             or manifest["price_scale"] != PRICE_SCALE
             or manifest["volume_scale"] != VOLUME_SCALE
@@ -433,10 +440,17 @@ class OHLCVQuantileWindowDataset(OHLCVWindowDataset):
     ``feature_columns`` selects covariate-cache columns for model input. When
     omitted, PVW windows use the cache's selected columns and covariate windows
     use every column, as recorded by checkpoints that predate the selection.
+    ``packed`` reads the same windows from a Megatron ``.bin/.idx`` directory
+    written by :func:`~megatron.bridge.data.datasets.ohlcv_indexed.pack_quantile_windows`.
     """
 
     def __init__(
-        self, *args: Any, pvw_cache: Path | None = None, feature_columns: list[int] | None = None, **kwargs: Any
+        self,
+        *args: Any,
+        pvw_cache: Path | None = None,
+        feature_columns: list[int] | None = None,
+        packed: Path | None = None,
+        **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.pvw_cache = pvw_cache
@@ -464,6 +478,13 @@ class OHLCVQuantileWindowDataset(OHLCVWindowDataset):
             if self.split != "train":
                 self._pvw_selection = np.load(pvw_cache / f"{self.split}-indices.npy", mmap_mode="r")
                 self._pvw_values = np.load(pvw_cache / f"{self.split}-values.npy", mmap_mode="r")
+        self.packed = None
+        if packed is not None:
+            from megatron.bridge.data.datasets.ohlcv_indexed import PackedQuantileWindows, packed_identity
+
+            self.packed = PackedQuantileWindows(packed)
+            if self.packed.metadata["identity"] != packed_identity(self):
+                raise ValueError("Packed windows do not match this dataset's inventory, features or caches.")
 
     def iter_raw_windows(
         self, raw_indices: NDArray[np.int64]
@@ -522,6 +543,13 @@ class OHLCVQuantileWindowDataset(OHLCVWindowDataset):
         features = np.zeros((len(indices), self.seq_length, channels), dtype=np.float32)
         labels = np.zeros((len(indices), self.horizon), dtype=np.float32)
         mask = np.zeros_like(labels)
+        if self.packed is not None:
+            features[valid], labels[valid] = self.packed.read(raw_indices)
+            mask[valid] = 1
+            return [
+                {"features": values, "labels": target, "loss_mask": weights}
+                for values, target, weights in zip(features, labels, mask, strict=True)
+            ]
         history = np.arange(self.seq_length)
         future = self.seq_length + np.arange(self.horizon)
         for positions, _, starts, arrays, denoised in self.iter_raw_windows(raw_indices):

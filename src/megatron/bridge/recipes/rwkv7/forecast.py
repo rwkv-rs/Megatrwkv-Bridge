@@ -79,6 +79,8 @@ class ForecastRun(TypedDict):
     validation_indices_sha256: NotRequired[str]
     pvw_cache: NotRequired[str]
     pvw_cache_sha256: NotRequired[str]
+    packed_train: NotRequired[str]
+    packed_train_sha256: NotRequired[str]
     data_workers: NotRequired[int]
 
 
@@ -107,6 +109,7 @@ class OHLCVDatasetConfig(DatasetProvider):
     validation_indices: str | None = None
     pvw_cache: str | None = None
     feature_columns: list[int] | None = None
+    packed_train: str | None = None
 
     def build_datasets(
         self, context: DatasetBuildContext
@@ -147,6 +150,7 @@ class OHLCVDatasetConfig(DatasetProvider):
                     window_indices=Path(self.validation_indices)
                     if split == "validation" and self.validation_indices
                     else None,
+                    **({"packed": Path(self.packed_train)} if split == "train" and self.packed_train else {}),
                 )
                 if count > 0
                 else None
@@ -172,6 +176,7 @@ def rwkv7_ohlcv_config(
     covariates: Path | None = None,
     validation_indices: Path | None = None,
     pvw_cache: Path | None = None,
+    packed_train: Path | None = None,
     data_workers: int | None = None,
 ) -> ConfigContainer:
     """Build continuous RWKV7 training with fixed, distributed holdout windows.
@@ -196,6 +201,7 @@ def rwkv7_ohlcv_config(
         validation_indices=str(validation_indices) if validation_indices else None,
         pvw_cache=str(pvw_cache) if pvw_cache else None,
         feature_columns=getattr(hf_config, "forecast_feature_columns", None),
+        packed_train=str(packed_train) if packed_train else None,
     )
     cfg.model.calculate_per_token_loss = True
     cfg.ddp.average_in_collective = False

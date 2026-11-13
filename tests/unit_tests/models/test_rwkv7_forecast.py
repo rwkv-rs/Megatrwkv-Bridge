@@ -270,6 +270,33 @@ def test_volatility_scaled_quantiles_score_scaled_units_and_predict_returns(conf
     assert restored.volatility_floor == 0.25
 
 
+def test_scaled_inputs_are_invariant_to_return_magnitude_and_keep_its_level(config):
+    from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import forecast_scaled_inputs
+
+    features = torch.randn(2, 8, 6)
+    scaled = torch.tensor([True, True, True, True, False, True])
+    louder = features.clone()
+    louder[..., scaled] *= 3
+    reference = forecast_scaled_inputs(features, scaled, floor=1e-3)
+    changed = forecast_scaled_inputs(louder, scaled, floor=1e-3)
+    torch.testing.assert_close(changed[..., :6], reference[..., :6])
+    torch.testing.assert_close(changed[..., 6], reference[..., 6] + torch.log(torch.tensor(3.0)))
+    config.hf_config.update(
+        forecast_task="direct_quantile",
+        forecast_horizon=3,
+        forecast_quantiles=[0.1, 0.5, 0.9],
+        forecast_input_size=6,
+        forecast_scaled_features=[0, 1, 2, 3, 5],
+        forecast_volatility_floor=1e-3,
+    )
+    model = RWKV7ForecastModel(config, None)
+    assert model.input_projection.in_features == 7
+    with patch.object(
+        model.hf, "forward", side_effect=lambda **kw: SimpleNamespace(last_hidden_state=kw["inputs_embeds"])
+    ):
+        assert model(features).shape == (2, 3, 3)
+
+
 def test_direct_quantile_training_excludes_market_inputs_and_calibrates_scaled_targets(tmp_path, monkeypatch):
     import numpy as np
 
@@ -310,6 +337,7 @@ def test_direct_quantile_training_excludes_market_inputs_and_calibrates_scaled_t
         covariates=covariates,
         pvw_cache=None,
         validation_indices=None,
+        packed_train=None,
         calibration_windows=4,
         normalize_inputs=False,
         head_gain=0.01,
@@ -344,6 +372,11 @@ def test_direct_quantile_training_excludes_market_inputs_and_calibrates_scaled_t
     assert hf_config["forecast_feature_columns"] == expected_columns
     assert not set(MARKET_FEATURE_NAMES) & set(hf_config["forecast_feature_names"])
     assert hf_config["forecast_input_size"] == len(expected_columns)
+    returns = {"open_return", "close_return", "upper_wick", "lower_wick", "return_5", "return_15", "return_30"}
+    returns |= {"return_60", "volatility_5", "volatility_15", "volatility_30", "volatility_60"}
+    assert [hf_config["forecast_feature_names"][i] for i in hf_config["forecast_scaled_features"]] == [
+        name for name in hf_config["forecast_feature_names"] if name in returns
+    ]
     assert all(kwargs["feature_columns"] == expected_columns for kwargs in created)
     assert captured[-1].dataset.feature_columns == expected_columns
     assert hf_config["forecast_volatility_floor"] == pytest.approx(1.0, rel=1e-6)

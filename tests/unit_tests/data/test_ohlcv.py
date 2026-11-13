@@ -65,6 +65,17 @@ def test_gaps_lunch_overnight_and_invalid_bars_cut_state():
     assert contiguous_segments(timestamps, bars) == [(0, 2), (2, 3), (4, 5), (5, 6), (6, 8)]
 
 
+def test_lunch_break_links_the_trading_day_but_overnight_cuts():
+    timestamps = np.array(
+        ["2026-01-05T11:29", "2026-01-05T11:30", "2026-01-05T13:01", "2026-01-05T13:02", "2026-01-06T09:31"],
+        dtype="datetime64[us]",
+    )
+    bars = np.tile([10, 11, 9, 10, 0], (5, 1)).astype(float)
+    assert contiguous_segments(timestamps, bars) == [(0, 4), (4, 5)]
+    # A missing 13:01 bar is a gap, not the lunch break.
+    assert contiguous_segments(np.delete(timestamps, 2), np.delete(bars, 2, axis=0)) == [(0, 2), (2, 3), (3, 4)]
+
+
 @pytest.fixture
 def prepared(tmp_path):
     source = tmp_path / "source"
@@ -392,3 +403,48 @@ def test_pvw_cache_matches_raw_ids_and_masks_final_batch(prepared, tmp_path):
     np.testing.assert_array_equal(frozen[1]["features"][:, -1], rows[1])
     with pytest.raises(ValueError, match="frozen PVW cache"):
         frozen[0]
+
+
+@pytest.mark.parametrize("with_pvw", [False, True])
+def test_packed_windows_match_memory_mapped_windows(prepared, tmp_path, with_pvw):
+    from megatron.bridge.data.datasets.ohlcv import OHLCVQuantileWindowDataset, manifest_digest
+    from megatron.bridge.data.datasets.ohlcv_covariates import prepare_covariates
+    from megatron.bridge.data.datasets.ohlcv_indexed import pack_quantile_windows
+
+    _, root = prepared
+    covariates = tmp_path / "covariates"
+    prepare_covariates(root, covariates, workers=1)
+    cache = None
+    if with_pvw:
+        cache = tmp_path / "pvw"
+        instrument = json.loads((root / "manifest.json").read_text())["instruments"][0]["path"]
+        (cache / "train" / instrument).mkdir(parents=True)
+        np.save(cache / "train" / instrument / "values.npy", np.arange(6, dtype=np.float32).reshape(2, 3) + 0.5)
+        (cache / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "source_manifest_sha256": manifest_digest(root),
+                    "covariates_sha256": manifest_digest(covariates),
+                    "context": 3,
+                    "horizon": 4,
+                    "windows": {"train": 2, "validation": 2, "test": 2},
+                    "columns": [0, 1, 2, 3, 4, 10],
+                }
+            )
+        )
+    kwargs = dict(
+        split="train", seq_length=3, horizon=4, covariates=covariates, pvw_cache=cache, feature_columns=[0, 1, 4, 19]
+    )
+    source = OHLCVQuantileWindowDataset(root, **kwargs)
+    pack_quantile_windows(source, tmp_path / "packed", workers=1)
+    packed = OHLCVQuantileWindowDataset(
+        root, packed=tmp_path / "packed", epochs=1, target_length=4, seed=1234, **kwargs
+    )
+    shuffled = OHLCVQuantileWindowDataset(root, epochs=1, target_length=4, seed=1234, **kwargs)
+    order = [1, 3, 0, 2]
+    for expected, actual in zip(shuffled.__getitems__(order), packed.__getitems__(order), strict=True):
+        np.testing.assert_array_equal(actual["features"], expected["features"])
+        np.testing.assert_allclose(actual["labels"], expected["labels"], rtol=0, atol=1e-5)
+        np.testing.assert_array_equal(actual["loss_mask"], expected["loss_mask"])
+    with pytest.raises(ValueError, match="Packed windows do not match"):
+        OHLCVQuantileWindowDataset(root, packed=tmp_path / "packed", **{**kwargs, "feature_columns": [0, 1]})

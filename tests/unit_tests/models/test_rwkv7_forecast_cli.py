@@ -10,7 +10,7 @@ pytestmark = pytest.mark.unit
 ENTRY = Path(__file__).resolve().parents[3] / "examples/models/rwkv7/forecast.py"
 
 
-@pytest.mark.parametrize("command", [[], ["prepare"], ["train"], ["predict"], ["evaluate"]])
+@pytest.mark.parametrize("command", [[], ["prepare"], ["train"], ["predict"], ["evaluate"], ["pack"]])
 def test_help_without_training_dependencies(monkeypatch, command):
     monkeypatch.setattr("sys.argv", [str(ENTRY), *command, "--help"])
     with pytest.raises(SystemExit) as result:

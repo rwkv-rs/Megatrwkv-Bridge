@@ -20,7 +20,11 @@ import torch
 from numpy.typing import NDArray
 
 from megatron.bridge.data.datasets.ohlcv import FEATURE_NAMES, PRICE_SCALE, OHLCVQuantileWindowDataset, manifest_digest
-from megatron.bridge.data.datasets.ohlcv_covariates import FORECAST_FEATURE_NAMES
+from megatron.bridge.data.datasets.ohlcv_covariates import (
+    FORECAST_FEATURE_NAMES,
+    MARKET_FEATURE_NAMES,
+    RETURN_FEATURE_NAMES,
+)
 from megatron.bridge.data.datasets.ohlcv_vmd import (
     CONTEXT,
     PEARSON_THRESHOLD,
@@ -79,25 +83,49 @@ def _sample_training(dataset: OHLCVQuantileWindowDataset) -> tuple[NDArray[np.in
 
 
 def _fit_features(dataset: OHLCVQuantileWindowDataset, indices: NDArray[np.int64]) -> dict[str, Any]:
+    """Rank covariates by their pinball gain for the model's own target.
+
+    The model predicts nine quantiles of labels divided by the window's
+    close-return RMS times sqrt(h), from return-unit inputs divided by that RMS
+    plus its log. Ranking with squared error on raw labels credits only mean
+    predictors and dropped every volatility covariate. Each horizon's booster
+    here fits those scaled-label quantiles, with the always-present base bars
+    and log scale as conditioning features; market aggregates are excluded.
+    """
     import xgboost as xgb
 
-    names = FORECAST_FEATURE_NAMES[len(FEATURE_NAMES) :]
-    inputs = np.empty((len(indices), len(names)), dtype=np.float32)
-    targets = np.empty((len(indices), 4), dtype=np.float32)
+    base = len(FEATURE_NAMES)
+    candidates = [
+        i for i in range(base, len(FORECAST_FEATURE_NAMES)) if FORECAST_FEATURE_NAMES[i] not in MARKET_FEATURE_NAMES
+    ]
+    last = np.empty((len(indices), len(FORECAST_FEATURE_NAMES)), dtype=np.float64)
+    returns = np.empty((len(indices), CONTEXT), dtype=np.float64)
+    targets = np.empty((len(indices), 4), dtype=np.float64)
+    horizons = np.array([1, 5, 15, 30])
     for positions, _, starts, arrays, _ in dataset.iter_raw_windows(indices):
         end = starts + CONTEXT - 1
-        inputs[positions] = arrays["features"][end, len(FEATURE_NAMES) :]
+        last[positions] = arrays["features"][end]
+        returns[positions] = arrays["features"][starts[:, None] + np.arange(CONTEXT), 1]
         targets[positions] = PRICE_SCALE * np.log(
-            arrays["close"][end[:, None] + np.array([1, 5, 15, 30])] / arrays["close"][end, None]
+            arrays["close"][end[:, None] + horizons] / arrays["close"][end, None]
         )
-    matrix = xgb.DMatrix(inputs, feature_names=list(names), nthread=16)
+    # Mirrors forecast_window_rms and forecast_scaled_inputs at the final bar.
+    rms = np.sqrt(np.mean(np.square(returns), axis=1))
+    scale = np.maximum(rms, np.quantile(rms[rms > 0], 0.05))
+    scaled = np.isin(np.asarray(FORECAST_FEATURE_NAMES), RETURN_FEATURE_NAMES)
+    last[:, scaled] /= scale[:, None]
+    inputs = np.column_stack((last[:, :base], last[:, candidates], np.log(scale)))
+    names = [*FEATURE_NAMES, *(FORECAST_FEATURE_NAMES[i] for i in candidates), "log_return_scale"]
+    matrix = xgb.DMatrix(inputs.astype(np.float32), feature_names=names, nthread=16)
+    levels = np.arange(1, 10) / 10
     scores = []
-    for horizon, target in zip((1, 5, 15, 30), targets.T, strict=True):
-        matrix.set_label(target)
+    for horizon, target in zip(horizons, targets.T, strict=True):
+        matrix.set_label(target / (scale * np.sqrt(horizon)))
         model = xgb.train(
             {
                 "tree_method": "hist",
-                "objective": "reg:squarederror",
+                "objective": "reg:quantileerror",
+                "quantile_alpha": levels,
                 "max_depth": 4,
                 "eta": 0.05,
                 "seed": SEED,
@@ -107,17 +135,20 @@ def _fit_features(dataset: OHLCVQuantileWindowDataset, indices: NDArray[np.int64
             num_boost_round=256,
         )
         gains = model.get_score(importance_type="total_gain")
-        values = np.array([gains.get(name, 0) for name in names])
+        values = np.array([gains.get(FORECAST_FEATURE_NAMES[i], 0) for i in candidates])
         scores.append(values / max(values.sum(), 1e-30))
-        logger.info("XGBoost feature ranking finished for horizon %d", horizon)
+        logger.info("XGBoost quantile feature ranking finished for horizon %d", horizon)
     mean_score = np.mean(scores, axis=0)
     ranked = np.argsort(-mean_score, kind="stable")[:11]
-    columns = [*range(len(FEATURE_NAMES)), *sorted(int(i) + len(FEATURE_NAMES) for i in ranked if mean_score[i] > 0)]
+    columns = [*range(base), *sorted(candidates[i] for i in ranked if mean_score[i] > 0)]
     return {
         "columns": columns,
         "feature_names": [*(FORECAST_FEATURE_NAMES[i] for i in columns), "pvw_log_close"],
         "xgboost_version": xgb.__version__,
-        "xgboost_importance": dict(zip(names, mean_score.tolist(), strict=True)),
+        "xgboost_objective": "reg:quantileerror, q0.1-q0.9 of labels / (RMS64 * sqrt(h))",
+        "xgboost_importance": {
+            FORECAST_FEATURE_NAMES[i]: float(v) for i, v in zip(candidates, mean_score, strict=True)
+        },
     }
 
 
@@ -263,7 +294,8 @@ def prepare_pvw(args: argparse.Namespace) -> None:
     }
     dataset = datasets["train"]
     identity = {
-        "version": 1,
+        # Version 2 ranks covariates by quantile loss on volatility-scaled labels.
+        "version": 2,
         "source_manifest_sha256": manifest_digest(args.data),
         "covariates_sha256": manifest_digest(args.covariates),
         "validation_indices_sha256": hashlib.sha256(args.validation_indices.read_bytes()).hexdigest(),
