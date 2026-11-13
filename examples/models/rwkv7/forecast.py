@@ -524,7 +524,7 @@ def main() -> None:
         "--early-stopping-patience",
         type=int,
         default=1000,
-        help="Stop when validation pinball has not improved for this many steps; 0 disables",
+        help="Stop direct quantile training when validation pinball has not improved for this many steps (0 disables)",
     )
     training.add_argument("--seed", type=int, default=1234)
     training.add_argument("--resume", type=Path)
@@ -664,8 +664,6 @@ def main() -> None:
             parser.error("--packed-train requires direct_quantile")
         if args.data_workers is not None and args.data_workers < 0:
             parser.error("Data worker count cannot be negative")
-        if args.early_stopping_patience < 0 or args.early_stopping_patience % args.eval_interval:
-            parser.error("--early-stopping-patience must be nonnegative and a multiple of --eval-interval")
         if (args.covariates or args.validation_indices) and args.task != "direct_quantile":
             parser.error("Covariates and frozen validation indices require direct_quantile")
         if args.task == "direct_quantile" and (args.forecast_horizon <= 0 or args.calibration_windows <= 0):
@@ -694,6 +692,10 @@ def main() -> None:
             or (args.epochs is not None and args.epochs <= 0)
         ):
             parser.error("Positive training settings and 0 <= warmup_steps < steps are required.")
+        if args.early_stopping_patience < 0:
+            parser.error("--early-stopping-patience must be nonnegative")
+        if args.task == "direct_quantile" and args.eval_iters and args.early_stopping_patience % args.eval_interval:
+            parser.error("--early-stopping-patience must be a multiple of --eval-interval")
         world = int(os.environ.get("WORLD_SIZE", "1"))
         if args.global_batch_size % (world * args.micro_batch_size):
             parser.error("global batch size must be divisible by world size times micro batch size")

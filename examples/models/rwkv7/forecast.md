@@ -537,7 +537,7 @@ checking still reports inherited framework `Any` types and dependent return-type
 errors. The full check log is retained with the runtime artifacts.
 
 
-## Past-only PVW and L12D768
+## Past-only PVW with L24D256
 
 The PVW experiment keeps the 64 completed bars, 30 future closes and nine
 quantiles of the direct-quantile task. It fits POA/VMD and XGBoost on training
@@ -587,7 +587,7 @@ timeout 168h uv run --no-sync python -m torch.distributed.run --standalone --npr
   --calibration-windows 4096 --normalize-inputs --head-gain 0.01 --head-fp32 --rwkv-optimizer
 
 timeout 1h uv run --no-sync python examples/models/rwkv7/forecast.py evaluate \
-  --checkpoint "$FORECAST_RUN/best-median-forecast.pt" --data "$FORECAST_DATA" \
+  --checkpoint "$FORECAST_RUN/best-forecast.pt" --data "$FORECAST_DATA" \
   --split test --horizon 30 --windows "$FORECAST_TEST" --direct-baseline-paths "$DIRECT_BASELINE" \
   --output "$FORECAST_RUN/evaluation/metrics.json"
 ```
