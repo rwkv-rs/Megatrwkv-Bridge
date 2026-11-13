@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from megatron.bridge.models.rwkv7.forecast_paths import PathForecast
 from megatron.bridge.models.rwkv7.modeling_rwkv7 import RWKV7Model
 from megatron.bridge.models.rwkv7.rwkv7_builder import RWKV7ModelBuilder
 from megatron.bridge.models.rwkv7.rwkv7_config import RWKV7ModelConfig
@@ -230,6 +231,21 @@ class RWKV7ForecastModel(RWKV7Model):
             raise ValueError(f"Expected nonempty [batch, time, {self.input_size}] context.")
         prediction = self(context)
         return prediction.sort(dim=-1).values if fix_quantile_crossing else prediction
+
+    @torch.inference_mode()
+    def predict_paths(
+        self, context: torch.Tensor, *, samples: int = 512, generator: torch.Generator | None = None
+    ) -> "PathForecast":
+        """Sample price paths for touch probabilities, timing and running extremes.
+
+        The quantile head describes where the price is at each minute; a trade
+        needs to know how it travels. This draws paths whose per-minute
+        marginals are the predicted quantiles.
+        """
+        from megatron.bridge.models.rwkv7.forecast_paths import sample_paths
+
+        quantiles = self.predict_quantiles(context)
+        return sample_paths(quantiles, self.quantile_levels, samples=samples, generator=generator)
 
     @torch.inference_mode()
     def generate(self, context: torch.Tensor, *, horizon: int) -> torch.Tensor:

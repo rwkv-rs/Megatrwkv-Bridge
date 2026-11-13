@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
+    import torch
+
     from megatron.bridge.models.rwkv7.modeling_rwkv7_forecast import RWKV7ForecastModel
     from megatron.bridge.recipes.rwkv7.forecast import ForecastCheckpoint
 
@@ -402,6 +404,8 @@ def predict(args: argparse.Namespace) -> None:
                             prices[h, q],
                         )
                     )
+        if args.barrier_pct is not None:
+            _report_barriers(model, features, args, exchange, symbol, timestamps[-1], float(bars[-1, 3]))
         logger.info("Saved direct quantile forecast to %s", args.output)
         return
     encoded = model.generate(features, horizon=args.horizon)[0].cpu().numpy()
@@ -418,6 +422,64 @@ def predict(args: argparse.Namespace) -> None:
         args.output,
         context,
         payload["step"],
+    )
+
+
+def _report_barriers(
+    model: "RWKV7ForecastModel",
+    features: "torch.Tensor",
+    args: argparse.Namespace,
+    exchange: str,
+    symbol: str,
+    origin: object,
+    anchor: float,
+) -> None:
+    """Write touch probabilities, first-touch minutes and running extremes."""
+    import json as _json
+
+    import torch
+
+    from megatron.bridge.data.datasets.ohlcv import PRICE_SCALE
+
+    generator = torch.Generator(device=features.device).manual_seed(1234)
+    forecast = model.predict_paths(features, samples=args.path_samples, generator=generator)
+    # Barriers are percentage moves; labels are PRICE_SCALE * log(close / anchor).
+    upper = PRICE_SCALE * math.log1p(args.barrier_pct / 100)
+    lower = PRICE_SCALE * math.log1p(-args.barrier_pct / 100)
+    up_minute, up_probability = forecast.first_touch_minute(upper)
+    down_minute, down_probability = forecast.first_touch_minute(lower)
+    levels = list(model.quantile_levels)
+    report = {
+        "exchange": exchange,
+        "symbol": symbol,
+        "context_end": str(origin),
+        "anchor_close": anchor,
+        "barrier_pct": args.barrier_pct,
+        "path_samples": args.path_samples,
+        "quantile_levels": levels,
+        "touch_upper_probability": float(up_probability[0]),
+        "touch_lower_probability": float(down_probability[0]),
+        "upper_before_lower_probability": float(forecast.barrier_race(upper, lower)[0]),
+        "median_first_touch_minute_upper": float(up_minute[0]),
+        "median_first_touch_minute_lower": float(down_minute[0]),
+        "running_max_pct_by_quantile": (torch.expm1(forecast.running_max[0, -1] / PRICE_SCALE) * 100).tolist(),
+        "running_min_pct_by_quantile": (torch.expm1(forecast.running_min[0, -1] / PRICE_SCALE) * 100).tolist(),
+    }
+    destination = args.output.with_name(args.output.stem + "-paths.json")
+    destination.write_text(_json.dumps(report, indent=2, allow_nan=False) + "\n")
+    numpy_destination = args.output.with_name(args.output.stem + "-paths.npy")
+    import numpy as _np
+
+    _np.save(numpy_destination, forecast.paths[0].cpu().numpy())
+    logger.info(
+        "Touch +%.2f%%: %.1f%% (median minute %.0f) | touch -%.2f%%: %.1f%% | upper first: %.1f%%; saved %s",
+        args.barrier_pct,
+        100 * report["touch_upper_probability"],
+        report["median_first_touch_minute_upper"],
+        args.barrier_pct,
+        100 * report["touch_lower_probability"],
+        100 * report["upper_before_lower_probability"],
+        destination,
     )
 
 
@@ -558,6 +620,12 @@ def main() -> None:
     prediction.add_argument("--output", type=Path, required=True)
     prediction.add_argument("--horizon", type=int, required=True)
     prediction.add_argument("--market", type=Path, help="Same-minute market statistics NPY aligned to instrument rows")
+    prediction.add_argument(
+        "--barrier-pct",
+        type=float,
+        help="Report touch probability, first-touch minute and running extremes for +/- this percent",
+    )
+    prediction.add_argument("--path-samples", type=int, default=512, help="Paths drawn for the barrier report")
     prediction.set_defaults(handler=predict)
     evaluation = commands.add_parser("evaluate", help="Free-running holdout evaluation against persistence")
     evaluation.add_argument("--checkpoint", type=Path, required=True)
@@ -703,6 +771,12 @@ def main() -> None:
             parser.error("--exit-interval must be positive")
     if args.command in ("predict", "evaluate") and args.horizon <= 0:
         parser.error("--horizon must be positive")
+    if (
+        args.command == "predict"
+        and args.barrier_pct is not None
+        and (args.barrier_pct <= 0 or args.path_samples <= 0)
+    ):
+        parser.error("--barrier-pct and --path-samples must be positive")
     if args.command == "evaluate" and args.max_windows <= 0:
         parser.error("--max-windows must be positive")
     args.handler(args)

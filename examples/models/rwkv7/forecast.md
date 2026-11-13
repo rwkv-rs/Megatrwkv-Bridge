@@ -306,11 +306,69 @@ validation pinball loss; `best-validation.json` records its score and step.
 optimizer, scheduler, RNG and consumed-sample state for resume. New task settings
 and calibration statistics are persisted with the weights.
 
+### Entry and exit timing
+
+The quantile head says where the price is at each minute, not how it travels,
+so it answers neither "does it reach +0.5% before -0.5%" nor "when". Both need
+the joint distribution over the 30 minutes. `predict_paths` draws paths whose
+per-minute marginals are exactly the predicted quantiles and whose dependence
+follows an MA(1) copula matching the measured lag-one return correlation of
+**-0.21**. Because the forecast fixes the spread at each horizon, steps that
+partly cancel must individually be larger, so such a path travels further
+before returning and reaches a barrier more often than independent steps would.
+
+```bash
+timeout 10m uv run --no-sync python examples/models/rwkv7/forecast.py predict \
+  --checkpoint "$FORECAST_RUN/best-forecast.pt" \
+  --instrument "$SNAPSHOT/data/stock_1m/SZ/000001.parquet" \
+  --horizon 30 --barrier-pct 0.5 --output runs/prediction.csv
+```
+
+This writes `prediction-paths.json` with the touch probability for each
+barrier, the probability that the upper one comes first, the median first-touch
+minute, and the running-extreme quantiles, plus `prediction-paths.npy` holding
+the sampled paths for plotting a fan rather than one flat median.
+
+Measured on the 4,096 frozen test windows with the step-4,000 checkpoint:
+
+| Quantity | Model | Realized |
+|---|---|---|
+| Touch +0.5% within 30 min, top predicted fifth | 0.562 | 0.529 |
+| Touch +0.5% within 30 min, middle fifth | 0.230 | 0.254 |
+| Mean touch probability, upper / lower | 0.253 / 0.272 | 0.270 / 0.284 |
+| Median first-touch minute | 13.0 | 11.0 |
+| Correlation of predicted and realized first-touch minute | +0.331 | |
+| Whole path inside the 80% band | 23.3% | 25.0% |
+
+Touch probabilities are calibrated to within a few points and the sampler's own
+whole-path rate matches the realized one, so the path dependence is right. Two
+biases to read around: the median running extreme is conservative (+31.7 bp
+predicted against +43.2 bp realized), while its tail is wide (the q90 running
+maximum covers 83.4% of outcomes against a nominal 90%). Treat the median
+extreme as a floor on the travel range, not an estimate of it.
+
+A barrier is worth trading only if it clears costs. On this dataset the
+one-minute return autocorrelation of -0.21 is mostly bid-ask bounce: it is
+-0.445 for moves of one tick or less and only -0.042 for shares above 100 CNY,
+so minute-level reversal does not survive a round trip of roughly 19 bp. The
++-0.5% barrier above is far enough out to clear that.
+
 Direct inference returns `[batch, horizon, quantile]` scaled cumulative returns.
 `predict_quantiles(..., fix_quantile_crossing=False)` returns raw outputs;
 the default sorts the quantile axis at each horizon. The `predict` CLI writes
 raw returns, sorted returns and price quantiles to CSV. Quantile ordering does
 not constrain the direction of prices over time.
+
+The median curve is flat compared with a realized path, and that is correct
+rather than a defect to tune away: a realized path is one draw, while the
+median is the centre of the distribution at each minute. Measured on the frozen
+test windows, the regression slope of the realized return on the predicted
+median falls from **1.35** at one minute to **0.14** at thirty, so the median
+carries real information at short horizons and almost none at thirty. Fitting a
+per-horizon shrinkage on half the test dates and applying it to the other half
+made every metric worse (MAE 49.33 to 49.76 bp), so that slope is noise, not a
+usable bias. Plot the sampled paths when the chart needs to show how price
+travels.
 
 The direct evaluator writes `paths.npz`, `predictions.csv`, `windows.json`,
 metrics JSON, `fixed.png`, `error_percentiles.png` and `quality.png`. A frozen
