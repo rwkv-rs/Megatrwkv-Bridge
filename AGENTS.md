@@ -110,3 +110,7 @@ Use `scripts/switch_mcore.sh` to switch versions.
 
 This file is the single source of agent instructions. For Claude Code
 compatibility, create a symlink: `ln -s AGENTS.md CLAUDE.md`
+
+## Pull request review
+
+Before reviewing or re-reviewing a pull request, read the [pull request review guide](.github/PR_REVIEW.md) and follow its rules.
