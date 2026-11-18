@@ -79,16 +79,34 @@ def test_checkpoint_backed_cpu_initialization(hf_config):
     assert model.hf.model.embed_tokens.weight.shape == (hf_config.vocab_size, hf_config.hidden_size)
 
 
-def test_labels_are_not_shifted_twice(hf_config):
+@pytest.mark.parametrize("chunk_size", [0, 3])
+def test_labels_are_not_shifted_twice(hf_config, chunk_size):
     cfg = RWKV7Bridge().hf_config_to_model_config(hf_config)
+    cfg.head_chunk_size = chunk_size
     model = RWKV7Model(cfg, Mock())
-    logits = torch.randn(2, 4, hf_config.vocab_size, requires_grad=True)
-    labels = torch.randint(hf_config.vocab_size, (2, 4))
-    with patch.object(model.hf, "forward", return_value=Mock(logits=logits)):
-        loss = model(input_ids=labels, labels=labels)
-    torch.testing.assert_close(loss, F.cross_entropy(logits.transpose(1, 2), labels, reduction="none"))
-    loss.mean().backward()
-    assert logits.grad is not None
+    tokens = torch.randint(hf_config.vocab_size, (2, 8))
+    labels = tokens[:, 1::2]
+    labels[0, -1] = -100
+    hidden = torch.randn(2, 4, hf_config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
+
+    def head_ce(hidden, weight, targets, *, chunk_rows, lora_a, lora_b, lora_scale, use_nora):
+        assert chunk_rows == (chunk_size or labels.numel())
+        assert targets.is_contiguous()
+        logits = F.linear(hidden, weight).float()
+        return F.cross_entropy(logits.transpose(1, 2), targets, reduction="none")
+
+    with (
+        patch.object(model.hf.model, "forward", return_value=Mock(last_hidden_state=hidden)),
+        patch("transformers.integrations.flash_rwkv2.load_flash_rwkv2") as load_flash,
+    ):
+        op = load_flash.return_value.pretrain_head_ce_bf16
+        op.side_effect = head_ce
+        losses = model(tokens[:, ::2], labels=labels)
+        expected = F.cross_entropy(model.hf.lm_head(hidden).float().transpose(1, 2), labels, reduction="none")
+        torch.testing.assert_close(losses, expected)
+        losses.sum().backward()
+    op.assert_called_once()
+    assert hidden.grad[0, -1].count_nonzero() == 0
 
 
 @pytest.mark.parametrize("use_nora", [False, True])

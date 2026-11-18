@@ -10,8 +10,8 @@ Use this project's uv-managed environment and pinned Megatron-LM submodule.
 The RWKV runtime requires [transformers-rwkv](https://github.com/rwkv-rs/transformers-rwkv),
 [FlashRWKV2](https://github.com/rwkv-rs/FlashRWKV2), and the corresponding
 [tokenizers-rwkv](https://github.com/rwkv-rs/tokenizers-rwkv) tokenizer implementation.
-The tested runtime uses Transformers 5.21.0.dev0, FlashRWKV2 0.1.0a18,
-PEFT 0.20.0, PyTorch 2.14.0+cu130 and Transformer Engine 2.16.0.
+RWKV7 training requires `FlashRWKV2==0.2.0a1` and a transformers-rwkv
+revision whose `rwkv` extra pins that version.
 The HF config must specify `architecture_version="rwkv7"`.
 
 Computation and model weights use BF16; WKV state/accumulation, logits and loss
@@ -26,7 +26,9 @@ files. For `corpus_text_document.bin` and `corpus_text_document.idx`, pass
 `--data corpus_text_document`. Prepare token IDs with the tokenizer and special
 tokens corresponding to the model config. The training NullTokenizer consumes
 those IDs directly. GPTDataset shifts labels; RWKV computes per-token cross
-entropy against the already shifted labels.
+entropy against the already shifted labels. The fused head returns one FP32
+loss per target, with zero loss for `-100`. Megatron applies the loss mask and
+counts valid tokens in its loss reduction.
 
 Run a small smoke test with the supplied architecture and generated tokens:
 
@@ -106,8 +108,10 @@ Changing microbatch retains the recipe's global batch unless
 other architectures or other hardware; it retains the HF context length.
 
 `--checkpoint-tmix` recomputes TimeMix; `--checkpoint-layers` recomputes complete
-layers. `--head-chunk-size` bounds the vocabulary projection, while
-`--infctx-chunk-size` and `--checkpoint-infctx` control state-passing chunks.
+layers. `--head-chunk-size` sets the number of token rows per vocabulary
+projection inside the fused CE operator for forward and backward. Zero uses
+all rows in the current forward. `--infctx-chunk-size` and `--checkpoint-infctx`
+control state-passing chunks.
 `--detach-infctx-state` explicitly selects truncated BPTT.
 
 ## Checkpoint, resume and HF export
