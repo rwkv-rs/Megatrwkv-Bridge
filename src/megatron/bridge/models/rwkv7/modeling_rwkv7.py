@@ -7,7 +7,6 @@ from functools import partial
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import make_sharded_tensor_for_checkpoint
 from torch.utils.checkpoint import checkpoint
@@ -109,7 +108,7 @@ class RWKV7Model(MegatronModule):
                 if self.detach_infctx_state:
                     states = tuple(state.detach() for state in states)
             return torch.cat(losses, dim=1)
-        if self.head_chunk_size and labels is not None:
+        if labels is not None:
             hidden = self.hf.model(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
@@ -118,41 +117,29 @@ class RWKV7Model(MegatronModule):
                 use_cache=False,
             ).last_hidden_state
             return self._head_loss(hidden, labels)
-        logits = self.hf(
+        return self.hf(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             attention_mask=attention_mask,
             use_cache=False,
         ).logits.float()
-        if labels is None:
-            return logits
-        return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1), reduction="none").view_as(
-            labels
-        )
 
     def _head_loss(self, hidden: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         from transformers.integrations.flash_rwkv2 import flash_rwkv2_linear_spec, load_flash_rwkv2
 
         weight, a, b, scale, nora = flash_rwkv2_linear_spec(self.hf.lm_head)
-        flash = load_flash_rwkv2("pretrain_head_linear_bf16", hidden, "head projection")
-
-        def project_loss(x: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-            logits = flash.pretrain_head_linear_bf16(
-                x.contiguous(), weight, lora_a=a, lora_b=b, lora_scale=scale, use_nora=nora
-            )
-            return F.cross_entropy(logits.float(), targets, reduction="none")
-
-        flat_hidden, flat_labels = hidden.reshape(-1, hidden.shape[-1]), labels.reshape(-1)
-        size = self.head_chunk_size or flat_hidden.shape[0]
-        losses = []
-        for start in range(0, flat_hidden.shape[0], size):
-            args = (flat_hidden[start : start + size], flat_labels[start : start + size])
-            if self.head_chunk_size and torch.is_grad_enabled():
-                losses.append(checkpoint(project_loss, *args, use_reentrant=False))
-            else:
-                losses.append(project_loss(*args))
-        return torch.cat(losses).view_as(labels)
+        flash = load_flash_rwkv2("pretrain_head_ce_bf16", hidden, "head loss")
+        return flash.pretrain_head_ce_bf16(
+            hidden.contiguous(),
+            weight,
+            labels.contiguous(),
+            chunk_rows=self.head_chunk_size or labels.numel(),
+            lora_a=a,
+            lora_b=b,
+            lora_scale=scale,
+            use_nora=nora,
+        )
 
     def _forward_chunk(self, tokens: torch.Tensor, labels: torch.Tensor, *states: torch.Tensor) -> tuple:
         from transformers.models.rwkv.modeling_rwkv import RwkvCache

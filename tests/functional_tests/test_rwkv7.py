@@ -16,6 +16,7 @@ pytest.importorskip("transformers.integrations.flash_rwkv2", reason="Requires tr
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.rwkv7 import RWKV7Bridge, RWKV7Model
 from megatron.bridge.peft.rwkv7 import RWKV7LoRA
+from megatron.bridge.training.losses import masked_next_token_loss
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA and FlashRWKV2")
@@ -103,13 +104,15 @@ def test_rwkv7_parity_and_lora_step(use_nora, checkpoint_strategy, rank, alpha):
     expected = reference(input_ids=tokens, use_cache=False).logits.float()
     actual = model(input_ids=tokens)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    RWKV7LoRA(dim=rank, alpha=alpha, use_nora=use_nora)(model)
+    peft = RWKV7LoRA(dim=rank, alpha=alpha, use_nora=use_nora)
+    peft.target_modules.append("lm_head")
+    peft(model)
     torch.testing.assert_close(model(input_ids=tokens), expected, rtol=0, atol=0)
     with torch.no_grad():
         for name, param in model.named_parameters():
             if "lora_B" in name:
                 param.normal_(std=1e-3)
-    RWKV7LoRA(dim=rank, alpha=alpha, use_nora=use_nora)(reference)
+    peft(reference)
     reference.load_state_dict(model.hf.state_dict())
     frozen_before = {
         name: param.detach().clone() for name, param in model.named_parameters() if not param.requires_grad
@@ -117,13 +120,19 @@ def test_rwkv7_parity_and_lora_step(use_nora, checkpoint_strategy, rank, alpha):
     trainable = [param for param in model.parameters() if param.requires_grad]
     adapters_before = [param.detach().clone() for param in trainable]
     optimizer = torch.optim.AdamW(trainable, lr=1e-3)
-    loss = model(input_ids=tokens, labels=labels).mean()
-    assert torch.isfinite(loss)
-    loss.backward()
+    labels[:, -1] = -100
+    mask = torch.ones_like(labels)
+    mask[:, ::2] = 0
+    mask[:, -1] = 0
+    losses = model(input_ids=tokens, labels=labels, loss_mask=mask)
     reference_logits = reference(input_ids=tokens, use_cache=False).logits.float()
-    reference_loss = F.cross_entropy(reference_logits.flatten(0, 1), labels.flatten())
-    torch.testing.assert_close(loss, reference_loss, rtol=0, atol=0)
-    reference_loss.backward()
+    expected_losses = F.cross_entropy(reference_logits.transpose(1, 2), labels, reduction="none")
+    torch.testing.assert_close(losses, expected_losses, rtol=1e-6, atol=1e-6)
+    assert losses[0, -1] == 0
+    total, count, _ = masked_next_token_loss(mask, losses, check_for_nan_in_loss=False)
+    assert count == mask.sum()
+    (total / count).backward()
+    expected_losses[mask.bool()].mean().backward()
     _assert_gradients_match(reference, model.hf)
     assert any(param.grad is not None and param.grad.abs().sum() > 0 for param in trainable)
     assert all(torch.isfinite(param.grad).all() for param in trainable if param.grad is not None)
@@ -160,6 +169,7 @@ def test_state_passing_preserves_loss_and_gradients(checkpoint_chunks, batch_siz
     actual.load_state_dict(reference.state_dict())
     tokens = torch.randint(config.vocab_size, (batch_size, 32), device="cuda")
     labels = tokens.roll(-1, dims=1)
+    labels[:, :: cfg.infctx_chunk_size] = -100
     reference_loss = reference(tokens, labels=labels)
     actual_loss = actual(tokens, labels=labels)
     torch.testing.assert_close(actual_loss, reference_loss, rtol=1e-5, atol=1e-5)
