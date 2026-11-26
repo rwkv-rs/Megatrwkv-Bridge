@@ -7,11 +7,20 @@ PEFT and distributed checkpoint interfaces.
 ## Runtime
 
 Use this project's uv-managed environment and pinned Megatron-LM submodule.
-The RWKV runtime requires [transformers-rwkv](https://github.com/rwkv-rs/transformers-rwkv),
-[FlashRWKV2](https://github.com/rwkv-rs/FlashRWKV2), and the corresponding
-[tokenizers-rwkv](https://github.com/rwkv-rs/tokenizers-rwkv) tokenizer implementation.
-RWKV7 training requires `FlashRWKV2==0.2.0a1` and a transformers-rwkv
-revision whose `rwkv` extra pins that version.
+RWKV7 training uses [FlashRWKV2 0.2.0a4](https://pypi.org/project/FlashRWKV2/0.2.0a4/),
+which requires PyTorch `>=2.11,<2.15` and TileLang `0.1.15`. With a compatible
+CUDA PyTorch build and the corresponding
+[tokenizers-rwkv](https://github.com/rwkv-rs/tokenizers-rwkv) implementation
+already installed, install the matching Transformers fork and its `rwkv` extra:
+
+```bash
+timeout 300s uv --no-config pip install --python .venv/bin/python \
+  'transformers[rwkv] @ git+https://github.com/rwkv-rs/transformers-rwkv.git@69fb76eb4e98736470c58404c21b8b3324bfa962'
+```
+
+`--no-config` lets the RWKV runtime resolve its TileLang version independently
+of the generic Bridge lock. Run the examples with `uv run --no-sync` to retain
+the installed RWKV runtime.
 The HF config must specify `architecture_version="rwkv7"`.
 
 Computation and model weights use BF16; WKV state/accumulation, logits and loss
